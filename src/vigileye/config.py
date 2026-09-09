@@ -23,7 +23,9 @@ class Settings:
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "gen-lang-client-0469618448"),
             bigquery_dataset=os.getenv("BIGQUERY_DATASET", "patchamomma_fleet"),
             data_source=os.getenv("DATA_SOURCE", "bigquery"),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+            # Pro, not Flash: a go/no-go call weighs conflicting signals against
+            # medical history, and is worth seconds of latency to get right.
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-pro-latest"),
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             api_base_url=os.getenv("API_BASE_URL", "http://localhost:8000"),
         )
