@@ -70,8 +70,10 @@ def get_evaluation(driver_id: str) -> dict:
 
 
 def api_health() -> dict:
+    # Generous timeout: the API scales to zero, so the first call of an idle
+    # period pays for a container boot plus BigQuery client auth.
     try:
-        return httpx.get(f"{API_BASE}/health", timeout=10.0, headers=auth_headers()).json()
+        return httpx.get(f"{API_BASE}/health", timeout=60.0, headers=auth_headers()).json()
     except httpx.HTTPError as exc:
         return {"status": "unreachable", "error": str(exc)}
 
