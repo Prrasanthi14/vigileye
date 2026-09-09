@@ -9,7 +9,7 @@ from .base import HISTORY_COLUMNS, LATEST_COLUMNS, DataConnector
 
 
 class SQLiteConnector(DataConnector):
-    def __init__(self, db_path: str = "patchamomma_fleet.db"):
+    def __init__(self, db_path: str = "vigileye_fleet.db"):
         self.db_path = db_path
 
     def _get_conn(self) -> sqlite3.Connection:

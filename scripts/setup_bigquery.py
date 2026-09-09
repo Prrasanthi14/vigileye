@@ -18,8 +18,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 PROJECT_ID = "969488392244"
-DATASET_ID = f"{PROJECT_ID}.patchamomma_fleet"
-SQLITE_DB = "patchamomma_fleet.db"
+DATASET_ID = f"{PROJECT_ID}.vigileye_fleet"
+SQLITE_DB = "vigileye_fleet.db"
 
 def setup_bigquery():
     client = bigquery.Client(project=PROJECT_ID)

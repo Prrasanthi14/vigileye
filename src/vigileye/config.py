@@ -21,7 +21,7 @@ class Settings:
     def from_env(cls) -> "Settings":
         return cls(
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "gen-lang-client-0469618448"),
-            bigquery_dataset=os.getenv("BIGQUERY_DATASET", "patchamomma_fleet"),
+            bigquery_dataset=os.getenv("BIGQUERY_DATASET", "vigileye_fleet"),
             data_source=os.getenv("DATA_SOURCE", "bigquery"),
             # Pro, not Flash: a go/no-go call weighs conflicting signals against
             # medical history, and is worth seconds of latency to get right.
