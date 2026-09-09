@@ -12,6 +12,32 @@ API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 API = f"{API_BASE}/api/v1"
 TIMEOUT = httpx.Timeout(60.0)
 
+_METADATA_IDENTITY = (
+    "http://metadata.google.internal/computeMetadata/v1/"
+    "instance/service-accounts/default/identity"
+)
+
+
+def auth_headers() -> dict[str, str]:
+    """ID token for calling the private readiness API from Cloud Run.
+
+    Returns no header locally, where the metadata server is absent and the API
+    is reachable without authentication.
+    """
+    if API_BASE.startswith("http://localhost"):
+        return {}
+    try:
+        r = httpx.get(
+            _METADATA_IDENTITY,
+            params={"audience": API_BASE},
+            headers={"Metadata-Flavor": "Google"},
+            timeout=5.0,
+        )
+        r.raise_for_status()
+        return {"Authorization": f"Bearer {r.text}"}
+    except httpx.HTTPError:
+        return {}
+
 st.set_page_config(
     page_title="VigilEye — Fleet Command Center",
     page_icon="🛡️",
@@ -24,28 +50,28 @@ st.html(f"<style>{(Path(__file__).parent / 'style.css').read_text()}</style>")
 
 @st.cache_data(ttl=60)
 def get_fleet() -> pd.DataFrame:
-    r = httpx.get(f"{API}/fleet", timeout=TIMEOUT)
+    r = httpx.get(f"{API}/fleet", timeout=TIMEOUT, headers=auth_headers())
     r.raise_for_status()
     return pd.DataFrame(r.json())
 
 
 @st.cache_data(ttl=60)
 def get_pilot(driver_id: str) -> dict:
-    r = httpx.get(f"{API}/pilots/{driver_id}", timeout=TIMEOUT)
+    r = httpx.get(f"{API}/pilots/{driver_id}", timeout=TIMEOUT, headers=auth_headers())
     r.raise_for_status()
     return r.json()
 
 
 @st.cache_data(ttl=60)
 def get_evaluation(driver_id: str) -> dict:
-    r = httpx.post(f"{API}/pilots/{driver_id}/evaluate", timeout=TIMEOUT)
+    r = httpx.post(f"{API}/pilots/{driver_id}/evaluate", timeout=TIMEOUT, headers=auth_headers())
     r.raise_for_status()
     return r.json()
 
 
 def api_health() -> dict:
     try:
-        return httpx.get(f"{API_BASE}/health", timeout=10.0).json()
+        return httpx.get(f"{API_BASE}/health", timeout=10.0, headers=auth_headers()).json()
     except httpx.HTTPError as exc:
         return {"status": "unreachable", "error": str(exc)}
 
@@ -64,7 +90,7 @@ with st.sidebar:
     options = ["🏠 Fleet Command Center"] + [
         f"{row.driver_id} - {row.name}" for row in fleet_df.itertuples()
     ]
-    selected = st.selectbox(":material/search: **Search or Select Pilot**", options, index=0)
+    selected = st.selectbox("🔎 **Search or Select Pilot**", options, index=0)
 
     st.divider()
     engine = "🧠 AI agent" if health.get("agent_key_configured") else "📐 Rules engine"
@@ -153,10 +179,10 @@ else:
 
     # Provenance: never present a deterministic fallback as agent output.
     if evaluation["source"] == "agent":
-        st.markdown('<div class="section-title">:material/psychology: AI Fatigue Analysis</div>',
+        st.markdown('<div class="section-title">🧠 AI Fatigue Analysis</div>',
                     unsafe_allow_html=True)
     else:
-        st.markdown('<div class="section-title">:material/rule: Rules-Based Analysis</div>',
+        st.markdown('<div class="section-title">📐 Rules-Based Analysis</div>',
                     unsafe_allow_html=True)
         st.warning(
             f"⚠️ AI agent unavailable — this verdict came from the deterministic rules engine. "
@@ -167,7 +193,7 @@ else:
         st.warning("Risk Factors: " + ", ".join(evaluation["risk_factors"]))
 
     if not history_df.empty:
-        st.markdown('<div class="section-title">:material/show_chart: 30-Day Historical Trend</div>',
+        st.markdown('<div class="section-title">📈 30-Day Historical Trend</div>',
                     unsafe_allow_html=True)
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Scatter(x=history_df["date"], y=history_df["total_sleep_hours"],
@@ -186,7 +212,7 @@ else:
         )
         st.plotly_chart(fig_hist, use_container_width=True)
 
-    st.markdown('<div class="section-title">:material/monitoring: Latest Sync Biometrics</div>',
+    st.markdown('<div class="section-title">📊 Latest Sync Biometrics</div>',
                 unsafe_allow_html=True)
 
     def metric(col, label, value, unit, detail, ok):
@@ -213,10 +239,10 @@ else:
            g("seven_day_avg_sleep") >= 6)
 
     if status == "PENDING_TEST":
-        st.markdown('<div class="section-title">:material/science: Trigger PVT</div>',
+        st.markdown('<div class="section-title">🧪 Trigger PVT</div>',
                     unsafe_allow_html=True)
         if st.button("🧪 Trigger Psychomotor Vigilance Test", use_container_width=True):
             with st.spinner("Running PVT..."):
-                pvt = httpx.post(f"{API}/pilots/{driver_id}/pvt", timeout=TIMEOUT).json()
+                pvt = httpx.post(f"{API}/pilots/{driver_id}/pvt", timeout=TIMEOUT, headers=auth_headers()).json()
                 st.success(f"Result: **{pvt['result']}** | Mean RT: {pvt['mean_reaction_ms']}ms "
                            f"| Lapses: {pvt['lapses']}")
