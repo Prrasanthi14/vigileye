@@ -6,27 +6,83 @@ A pilot flying several legs a day accumulates fatigue that a duty-hours table ca
 
 **Live dashboard:** https://vigileye-dashboard-969488392244.us-central1.run.app
 
+> New to the terminology (PVT, HRV, WOCL)? There's a [glossary at the end](#glossary).
+
 ---
 
-## Glossary
+## System design
 
-Aviation fatigue science and wearable metrics carry a lot of shorthand. Everything used in this project, in one place:
+Every number below was measured on this deployment, not estimated.
 
-| Term | Stands for | What it means here |
+### Scalability
+
+**Stateless services, stateful storage.** The API holds no session state, so Cloud Run scales it horizontally and to zero. Verdicts and readings live in BigQuery; any instance can serve any request.
+
+**The decisive choice is *what* gets computed, not how fast.** A verdict is keyed on `(driver_id, reading_date)` and stored, so cost is **one model call per pilot per day** rather than one per page view. A fleet grid viewed 500 times costs zero model calls.
+
+**Where it stops scaling, stated honestly.** A whole-fleet sweep is O(pilots) in model calls:
+
+| Fleet | Full sweep |
+|---|---|
+| 100 (this deployment) | **5 min** — measured |
+| ~5,000 (IndiGo scale) | ~4.2 hours |
+| ~15,000 (major US carrier) | ~12.5 hours |
+
+Past a few hundred pilots the sweep is the wrong shape. The fix is in the design already: the roster stores each pilot's `report_time`, so evaluating a pilot ~2h before they report spreads identical work across 24 hours and touches only pilots actually flying. At 5,000 pilots with 40% on duty that's **1.4 calls/minute** — the same infrastructure, no sweep.
+
+### Latency
+
+Three paths, deliberately different costs:
+
+| Path | Model calls | Measured |
 |---|---|---|
-| **PVT** | Psychomotor Vigilance Test | A real reaction-time test used in aviation and military fatigue management. Measures mean reaction time and *lapses* (attention failures). VigilEye escalates borderline pilots to a PVT instead of guessing. |
-| **HRV** | Heart Rate Variability | Beat-to-beat variation, in milliseconds. **Higher is better** — it signals nervous-system recovery. Below ~35 ms suggests poor recovery or stress. The single strongest fatigue signal here. |
-| **RMSSD** | Root Mean Square of Successive Differences | The specific way HRV is calculated by most wearables. When the dashboard says "HRV (RMSSD)", this is the method. |
-| **WOCL** | Window of Circadian Low | The 02:00–05:00 body-clock trough where alertness bottoms out. Reporting for duty inside this window is an independent risk factor, regardless of how well the pilot slept. |
-| **Resting HR** | Resting Heart Rate | Beats per minute at rest. **Lower is better.** Moves inversely to HRV — an elevated resting HR alongside suppressed HRV indicates accumulated strain. |
-| **Deep sleep %** | — | Share of sleep in slow-wave stages. Healthy is >13%. The first stage to suffer under sleep debt or sleep apnea. |
-| **REM sleep %** | Rapid Eye Movement | Share of sleep in REM. Healthy is >15%. Tied to cognitive recovery. |
-| **Sleep architecture** | — | The overall split across deep / REM / light / awake. Two pilots can sleep 7 hours and recover very differently depending on this split. |
-| **Acute vs chronic fatigue** | — | *Acute* is one bad night. *Chronic* is a 7-day average below ~6 hours. Chronic restriction dramatically amplifies the risk of any acute loss — which is why the agent receives both. |
-| **Consecutive duty days** | — | Days flown without a rest period. Drives cumulative fatigue. |
-| **Go/no-go** | — | The aviation term for a binary fitness-for-duty decision made before a flight. |
-| **FRMS** | Fatigue Risk Management System | The regulatory framework (FAA/EASA) this problem sits inside. |
-| **Agent** | — | In this codebase, specifically the Gemini model call that produces a verdict — as opposed to the deterministic *rules engine*. |
+| Fleet grid (100 pilots) | **0** | two BigQuery reads |
+| Pilot page, verdict fresh | **0** | **2.3 s** |
+| Pilot page, verdict absent/stale | 1 | **21.3 s** |
+
+The 9× gap between a stored and a computed verdict is the entire argument for the cache. Supporting measures: batch work runs on 6 concurrent workers; the dashboard caches API responses for 60 s; and the health check allows 60 s because Cloud Run scales to zero and the first request after idle pays for a container boot plus BigQuery auth.
+
+**Latency is also a correctness property here.** `time_awake_since_last_sleep` climbs with the clock, so a verdict has a shelf life regardless of whether the data changed. Past `VERDICT_MAX_AGE_MINUTES` (default 120) it is recomputed rather than served.
+
+### Rate limiting
+
+This one was learned the hard way. A first fleet run used 12 concurrent workers against Gemini Pro's **25 requests/minute** quota: **71 of 100 pilots failed** and silently degraded to the rules engine.
+
+Two mechanisms now:
+
+```python
+# src/vigileye/scoring/agent.py
+RPM_LIMIT = int(os.getenv("GEMINI_RPM", "20"))   # stay under the per-model quota
+
+def _throttle() -> None:
+    while True:
+        with _lock:
+            now = time.monotonic()
+            while _recent_calls and now - _recent_calls[0] > 60:
+                _recent_calls.popleft()
+            if len(_recent_calls) < RPM_LIMIT:
+                _recent_calls.append(now)
+                return
+            wait = 60 - (now - _recent_calls[0]) + 0.05
+        time.sleep(wait)
+```
+
+A thread-safe sliding window paces calls below the quota, and `RESOURCE_EXHAUSTED` responses retry with backoff. Re-run after the fix: **71 evaluated, 0 failed.** `GEMINI_RPM` tracks whatever quota the account actually has.
+
+### Fault tolerance and availability
+
+The fourth pillar — the system degrades rather than fails, and *says so*.
+
+- **Agent unavailable → deterministic rules engine.** No blank screen, no 500. A go/no-go tool that returns nothing when an API is down is worse than one that returns a conservative answer.
+- **Degradation is never silent.** Every verdict carries `source: "agent" | "rules"` and a `fallback_reason`. The dashboard renders a different heading and a visible warning. This is what caught the 71-failure incident above.
+- **Storage failures are contained.** A BigQuery client that fails to initialise leaves the connector returning empty results rather than crashing the service; verdict cache read/write failures are logged and swallowed, because losing the cache must not lose the verdict.
+- **A degraded verdict is never cached.** Rules fallbacks are deliberately not stored, so the system retries the agent instead of freezing a downgraded answer.
+
+### Consistency
+
+Worth naming, because it was the original failure mode. This codebase once had **three different definitions of go/no-go** — a two-line heuristic in the dashboard, an eight-factor rules engine, and the agent — so a pilot could read CLEAR in the grid and GROUNDED on their own page.
+
+Now: one scoring engine, one stored verdict per pilot-day, read by both views. Writes invalidate the affected verdict, and ingestion upserts per pilot-day so two rows can never exist for one pilot-day leaving "latest reading" non-deterministic.
 
 ---
 
@@ -344,3 +400,27 @@ The current deployment is a **demo running entirely on synthetic data**. No real
 | `gemini-pro-latest` is a moving pointer | Fine while iterating | Pin a version and re-validate on upgrade — a safety decision engine should not change silently |
 
 Loading real pilot data would make the first two rows blocking, not optional: medical history is regulated health data.
+
+---
+
+## Glossary
+
+Aviation fatigue science and wearable metrics carry a lot of shorthand. Everything used in this project, in one place:
+
+| Term | Stands for | What it means here |
+|---|---|---|
+| **PVT** | Psychomotor Vigilance Test | A real reaction-time test used in aviation and military fatigue management. Measures mean reaction time and *lapses* (attention failures). VigilEye escalates borderline pilots to a PVT instead of guessing. |
+| **HRV** | Heart Rate Variability | Beat-to-beat variation, in milliseconds. **Higher is better** — it signals nervous-system recovery. Below ~35 ms suggests poor recovery or stress. The single strongest fatigue signal here. |
+| **RMSSD** | Root Mean Square of Successive Differences | The specific way HRV is calculated by most wearables. When the dashboard says "HRV (RMSSD)", this is the method. |
+| **WOCL** | Window of Circadian Low | The 02:00–05:00 body-clock trough where alertness bottoms out. Reporting for duty inside this window is an independent risk factor, regardless of how well the pilot slept. |
+| **Resting HR** | Resting Heart Rate | Beats per minute at rest. **Lower is better.** Moves inversely to HRV — an elevated resting HR alongside suppressed HRV indicates accumulated strain. |
+| **Deep sleep %** | — | Share of sleep in slow-wave stages. Healthy is >13%. The first stage to suffer under sleep debt or sleep apnea. |
+| **REM sleep %** | Rapid Eye Movement | Share of sleep in REM. Healthy is >15%. Tied to cognitive recovery. |
+| **Sleep architecture** | — | The overall split across deep / REM / light / awake. Two pilots can sleep 7 hours and recover very differently depending on this split. |
+| **Acute vs chronic fatigue** | — | *Acute* is one bad night. *Chronic* is a 7-day average below ~6 hours. Chronic restriction dramatically amplifies the risk of any acute loss — which is why the agent receives both. |
+| **Consecutive duty days** | — | Days flown without a rest period. Drives cumulative fatigue. |
+| **Go/no-go** | — | The aviation term for a binary fitness-for-duty decision made before a flight. |
+| **FRMS** | Fatigue Risk Management System | The regulatory framework (FAA/EASA) this problem sits inside. |
+| **Agent** | — | In this codebase, specifically the Gemini model call that produces a verdict — as opposed to the deterministic *rules engine*. |
+
+---
