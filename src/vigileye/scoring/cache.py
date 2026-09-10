@@ -53,7 +53,7 @@ def get_verdict(driver_id: str, reading_date: date) -> Evaluation | None:
 
     query = f"""
         SELECT status, score, source, reasoning, recommended_action,
-               risk_factors, circadian_note
+               risk_factors, circadian_note, evaluated_at
         FROM `{_table_id()}`
         WHERE driver_id = @driver_id AND reading_date = @reading_date
         ORDER BY evaluated_at DESC LIMIT 1
@@ -69,6 +69,7 @@ def get_verdict(driver_id: str, reading_date: date) -> Evaluation | None:
                 reasoning=row.reasoning, recommended_action=row.recommended_action,
                 risk_factors=json.loads(row.risk_factors or "[]"),
                 circadian_note=row.circadian_note or "",
+                evaluated_at=row.evaluated_at,
             )
     except Exception as exc:
         logger.warning("Verdict cache read failed: %s", exc)
@@ -134,7 +135,7 @@ def invalidate(driver_id: str, reading_date: date | None = None) -> None:
 def get_fleet_verdicts() -> dict[str, dict]:
     """Latest stored verdict per pilot, keyed by driver_id."""
     query = f"""
-        SELECT driver_id, status, score, source, reading_date
+        SELECT driver_id, status, score, source, reading_date, evaluated_at
         FROM `{_table_id()}`
         QUALIFY ROW_NUMBER() OVER (PARTITION BY driver_id
                                    ORDER BY reading_date DESC, evaluated_at DESC) = 1
@@ -144,6 +145,7 @@ def get_fleet_verdicts() -> dict[str, dict]:
             row.driver_id: {
                 "status": row.status, "score": row.score,
                 "source": row.source, "reading_date": row.reading_date,
+                "evaluated_at": row.evaluated_at,
             }
             for row in _client().query(query).result()
         }

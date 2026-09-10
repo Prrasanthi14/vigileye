@@ -2,14 +2,38 @@
 
 import logging
 import random
+from datetime import datetime, timezone
 from typing import Any
 
+from ..config import settings
 from ..models import Evaluation
 from . import cache
 from .agent import AgentUnavailable, evaluate_with_agent
 from .rules import evaluate_with_rules
 
 logger = logging.getLogger(__name__)
+
+
+def verdict_age_minutes(evaluation: Evaluation) -> float | None:
+    """How long ago this verdict was reached, in minutes."""
+    if evaluation.evaluated_at is None:
+        return None
+    stamped = evaluation.evaluated_at
+    if stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - stamped).total_seconds() / 60
+
+
+def is_stale(evaluation: Evaluation) -> bool:
+    """Whether a stored verdict is too old to fly on.
+
+    Fatigue moves with the clock — hours awake climb whether or not the stored
+    reading changes — so a verdict has a shelf life independent of the data it
+    was computed from. Past it, the pilot is re-evaluated against whatever the
+    tracker has landed since.
+    """
+    age = verdict_age_minutes(evaluation)
+    return age is not None and age > settings.verdict_max_age_minutes
 
 
 def evaluate_readiness(data: dict[str, Any], use_cache: bool = True) -> Evaluation:
@@ -27,12 +51,13 @@ def evaluate_readiness(data: dict[str, Any], use_cache: bool = True) -> Evaluati
 
     if use_cache and driver_id and reading_date:
         cached = cache.get_verdict(driver_id, reading_date)
-        if cached:
+        if cached and not is_stale(cached):
             return cached
 
     try:
         result = evaluate_with_agent(data)
-        evaluation = Evaluation(**result.model_dump(), source="agent")
+        evaluation = Evaluation(**result.model_dump(), source="agent",
+                                evaluated_at=datetime.now(timezone.utc))
         if driver_id and reading_date:
             cache.put_verdict(driver_id, reading_date, evaluation)
         return evaluation

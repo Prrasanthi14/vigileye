@@ -1,6 +1,6 @@
 """Shared domain models for pilot readiness evaluation."""
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -26,6 +26,7 @@ class Evaluation(ReadinessEvaluation):
 
     source: Literal["agent", "rules"]
     fallback_reason: str | None = None
+    evaluated_at: datetime | None = None
 
 
 class PilotCreate(BaseModel):

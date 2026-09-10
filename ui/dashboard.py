@@ -1,6 +1,7 @@
 """VigilEye pilot dashboard — a thin client over the readiness API."""
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -39,9 +40,13 @@ def auth_headers() -> dict[str, str]:
     except httpx.HTTPError:
         return {}
 
+ASSETS = Path(__file__).parent / "assets"
+LOGO_PATH = ASSETS / "vigileye-logo.png"      # wordmark, for the sidebar
+ICON_PATH = ASSETS / "vigileye-icon.png"      # circular mark, for the browser tab
+
 st.set_page_config(
     page_title="VigilEye — Fleet Command Center",
-    page_icon="🛡️",
+    page_icon=str(ICON_PATH) if ICON_PATH.exists() else "🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -70,7 +75,31 @@ def get_evaluation(driver_id: str) -> dict:
     return r.json()
 
 
+def force_reevaluation(driver_id: str) -> dict:
+    """Run the agent again now, ignoring any stored verdict."""
+    r = httpx.post(f"{API}/pilots/{driver_id}/evaluate", params={"refresh": "true"},
+                   timeout=TIMEOUT, headers=auth_headers())
+    r.raise_for_status()
+    return r.json()
+
+
 FUZZY_CUTOFF = 72
+MAX_AGE_MIN = int(os.getenv("VERDICT_MAX_AGE_MINUTES", "120"))
+
+
+def format_age(minutes) -> str:
+    """Human-readable age of a verdict."""
+    if minutes is None or pd.isna(minutes):
+        return "not yet judged"
+    minutes = int(minutes)
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes} min ago"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.1f} h ago"
+    return f"{hours / 24:.1f} d ago"
 
 
 def fuzzy_match(df: pd.DataFrame, text: str, limit: int = 10) -> pd.DataFrame:
@@ -110,7 +139,10 @@ if health.get("status") != "ok":
     st.stop()
 
 with st.sidebar:
-    st.markdown("# 🛡️ VigilEye")
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), use_container_width=True)
+    else:
+        st.markdown("# 🛡️ VigilEye")
     st.caption("Pilot Readiness Command Center")
     st.divider()
 
@@ -177,20 +209,37 @@ with st.sidebar:
     )
 
 if selected == "🏠 Fleet Command Center":
-    st.markdown("## Fleet Overview (Latest Sync)")
+    st.markdown("## Fleet Overview")
     if filtering:
         st.caption(f"Showing {len(matches)} of {len(fleet_df)} pilots matching your filter")
     else:
         st.caption(f"Readiness for {len(fleet_df)} pilots, scored by the same engine as the detail view")
 
     icon = {"CLEAR": "✅ CLEAR", "PENDING_TEST": "🟡 PENDING", "GROUNDED": "🔴 GROUNDED"}
+
+    # Risk first. This dashboard exists to surface exceptions, so the pilots who
+    # cannot fly lead; a reader should never scroll past cleared crew to find
+    # them. Column headers still re-sort by name, ID or score on click.
+    order = {"GROUNDED": 0, "PENDING_TEST": 1, "CLEAR": 2}
     # The table shows the filtered set: filtering only the sidebar dropdown
     # left the grid showing all 100 pilots, which read as the filter doing nothing.
-    grid = matches.assign(Status=matches["status"].map(icon))[
-        ["driver_id", "name", "role", "Status", "score",
-         "total_sleep_hours", "hrv_ms", "consecutive_duty_days"]
-    ]
-    grid.columns = ["ID", "Name", "Role", "Readiness Status", "Score",
+    ranked = matches.assign(_rank=matches["status"].map(order)).sort_values(
+        ["_rank", "score"], ascending=[True, True]
+    )
+
+    stale_count = int(ranked["stale"].sum()) if "stale" in ranked else 0
+    if stale_count:
+        st.warning(
+            f"⏱️ {stale_count} verdict(s) older than {MAX_AGE_MIN // 60}h — "
+            "re-evaluated automatically when that pilot is next opened."
+        )
+
+    grid = ranked.assign(
+        Status=ranked["status"].map(icon),
+        Judged=ranked["age_minutes"].map(format_age),
+    )[["driver_id", "name", "role", "Status", "score", "Judged",
+       "total_sleep_hours", "hrv_ms", "consecutive_duty_days"]]
+    grid.columns = ["ID", "Name", "Role", "Readiness Status", "Score", "Verdict age",
                     "Sleep (hrs)", "HRV (ms)", "Consecutive Days"]
     st.dataframe(grid, use_container_width=True, hide_index=True, height=600)
 
@@ -202,6 +251,11 @@ else:
 
     with st.spinner("🧠 Running readiness evaluation..."):
         evaluation = get_evaluation(driver_id)
+
+    # A verdict under the staleness threshold is reused rather than recomputed,
+    # so opening a pilot does not itself mean a fresh judgement was made.
+    if st.session_state.pop(f"refreshed_{driver_id}", False):
+        st.toast(f"{driver_id} re-evaluated just now", icon="🧠")
 
     initials = "".join(n[0] for n in str(snapshot.get("name", "??")).split()[:2])
     medical = snapshot.get("medical_history", "None")
@@ -222,6 +276,14 @@ else:
     """, unsafe_allow_html=True)
 
     status, score = evaluation["status"], evaluation["score"]
+
+    stamped = evaluation.get("evaluated_at")
+    if stamped:
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(stamped)).total_seconds() / 60
+        verdict_age = format_age(age)
+    else:
+        verdict_age = "just now"
     status_class = {"CLEAR": "status-clear", "PENDING_TEST": "status-pending",
                     "GROUNDED": "status-grounded"}.get(status, "status-pending")
     status_icon = {"CLEAR": "✅", "PENDING_TEST": "⚠️", "GROUNDED": "🛑"}.get(status, "⚠️")
@@ -233,7 +295,8 @@ else:
             <div style="padding: 24px 28px;">
                 <div class="status-badge {status_class}">{status_icon} {status}</div>
                 <div style="margin-top:16px; font-size:0.82rem; color:rgba(232,236,241,0.5);">
-                    Evaluation Date: {str(snapshot.get('last_sync_timestamp', 'now'))[:10]}
+                    Readings from: {str(snapshot.get('last_sync_timestamp', 'now'))[:10]}<br>
+                    Verdict reached: {verdict_age}
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -272,6 +335,23 @@ else:
     st.info(evaluation["reasoning"])
     if evaluation["risk_factors"]:
         st.warning("Risk Factors: " + ", ".join(evaluation["risk_factors"]))
+
+    age_col, button_col = st.columns([3, 1])
+    with age_col:
+        st.caption(
+            f"Verdict reached **{verdict_age}** from readings dated "
+            f"{str(snapshot.get('last_sync_timestamp', '—'))[:10]}. "
+            f"Verdicts under {MAX_AGE_MIN // 60}h old are reused rather than recomputed."
+        )
+    with button_col:
+        if st.button("🔄 Re-evaluate now", use_container_width=True,
+                     help="Run the agent again against the latest readings"):
+            with st.spinner("Running the agent..."):
+                force_reevaluation(driver_id)
+            get_evaluation.clear()
+            get_fleet.clear()
+            st.session_state[f"refreshed_{driver_id}"] = True
+            st.rerun()
 
     if not history_df.empty:
         st.markdown('<div class="section-title">📈 30-Day Historical Trend</div>',

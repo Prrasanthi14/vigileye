@@ -16,6 +16,7 @@ class Settings:
     gemini_model: str
     gemini_api_key: str | None
     api_base_url: str
+    verdict_max_age_minutes: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -28,6 +29,9 @@ class Settings:
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-pro-latest"),
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             api_base_url=os.getenv("API_BASE_URL", "http://localhost:8000"),
+            # Fatigue moves with the clock, so a verdict has a shelf life: past
+            # this age it is re-run against whatever the tracker has since landed.
+            verdict_max_age_minutes=int(os.getenv("VERDICT_MAX_AGE_MINUTES", "120")),
         )
 
 

@@ -2,6 +2,7 @@
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query
 
@@ -41,16 +42,27 @@ def fleet() -> list[dict]:
     df = get_connector().get_fleet_summary()
     verdicts = cache.get_fleet_verdicts()
 
+    now = datetime.now(timezone.utc)
     rows = []
     for record in df.to_dict("records"):
         verdict = verdicts.get(record["driver_id"])
         if verdict:
-            rows.append({**record, "score": verdict["score"],
-                         "status": verdict["status"], "source": verdict["source"]})
+            stamped = verdict.get("evaluated_at")
+            age = (now - stamped).total_seconds() / 60 if stamped else None
+            rows.append({
+                **record,
+                "score": verdict["score"],
+                "status": verdict["status"],
+                "source": verdict["source"],
+                "evaluated_at": stamped.isoformat() if stamped else None,
+                "age_minutes": round(age) if age is not None else None,
+                "stale": age is not None and age > settings.verdict_max_age_minutes,
+            })
         else:
             score, _, _ = score_pilot(record)
             status, _ = status_for(score)
-            rows.append({**record, "score": score, "status": status, "source": "rules"})
+            rows.append({**record, "score": score, "status": status, "source": "rules",
+                         "evaluated_at": None, "age_minutes": None, "stale": True})
     return rows
 
 
@@ -58,10 +70,15 @@ def fleet() -> list[dict]:
 def evaluate_fleet(limit: int = 100, workers: int = 6) -> dict:
     """Run the agent across the fleet and store each verdict.
 
-    Intended for a scheduled run (once per biometric sync), not per page view:
-    it costs one model call per pilot whose current reading has no verdict.
-    Calls run concurrently because a single Pro evaluation takes ~20s, which
-    would otherwise exceed the request deadline well before the fleet is done.
+    Operator-triggered — nothing calls this on a timer. It costs one model call
+    per pilot whose verdict is missing, stale, or about superseded readings;
+    pilots already judged on their current data are skipped.
+
+    Calls run concurrently because a single Pro evaluation takes ~20s. At fleet
+    sizes beyond a few hundred pilots this whole-fleet sweep stops being the
+    right shape: evaluating each pilot shortly before their report time spreads
+    the same work across the day and keeps every verdict fresh at the moment it
+    is used.
     """
     cache.ensure_table()
     connector = get_connector()
@@ -73,7 +90,12 @@ def evaluate_fleet(limit: int = 100, workers: int = 6) -> dict:
         if not snapshot:
             continue
         existing = verdicts.get(record["driver_id"])
-        if existing and existing["reading_date"] == snapshot.get("last_sync_timestamp"):
+        stamped = existing.get("evaluated_at") if existing else None
+        fresh = stamped is not None and (
+            (datetime.now(timezone.utc) - stamped).total_seconds() / 60
+            <= settings.verdict_max_age_minutes
+        )
+        if existing and fresh and existing["reading_date"] == snapshot.get("last_sync_timestamp"):
             already_current += 1
         else:
             pending.append(snapshot)

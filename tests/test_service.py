@@ -1,6 +1,6 @@
 """Verdict provenance and the agent-to-rules fallback."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -104,3 +104,60 @@ def test_pvt_simulation_is_internally_consistent(score):
     result = service.simulate_pvt_test(score)
     assert result["result"] in {"PASS", "FAIL"}
     assert result["fastest_ms"] <= result["mean_reaction_ms"] <= result["slowest_ms"]
+
+
+class TestVerdictStaleness:
+    """A verdict has a shelf life: hours awake climb whether the stored reading
+    changes or not, so an old verdict is re-run rather than served."""
+
+    def _stored(self, minutes_old: float) -> Evaluation:
+        return Evaluation(
+            status="CLEAR", score=95, reasoning="stored", recommended_action="a",
+            risk_factors=[], circadian_note="", source="agent",
+            evaluated_at=datetime.now(timezone.utc) - timedelta(minutes=minutes_old),
+        )
+
+    @pytest.mark.parametrize("age,expected", [(1, False), (119, False),
+                                              (121, True), (600, True)])
+    def test_staleness_threshold(self, age, expected):
+        assert service.is_stale(self._stored(age)) is expected
+
+    def test_verdict_without_timestamp_is_not_stale(self):
+        evaluation = self._stored(1)
+        evaluation.evaluated_at = None
+        assert service.is_stale(evaluation) is False
+
+    def test_naive_timestamp_is_read_as_utc(self):
+        """Verdicts are stored in UTC, so a timestamp that arrives without a
+        timezone is UTC rather than local wall-clock time."""
+        evaluation = self._stored(1)
+        naive_utc = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=30)
+        evaluation.evaluated_at = naive_utc
+        assert service.verdict_age_minutes(evaluation) == pytest.approx(30, abs=1)
+
+    def test_fresh_verdict_is_served_without_calling_the_agent(self, monkeypatch):
+        stored = self._stored(10)
+        monkeypatch.setattr(service.cache, "get_verdict", lambda d, dt: stored)
+        monkeypatch.setattr(service.cache, "put_verdict", lambda *a: None)
+        monkeypatch.setattr(service, "evaluate_with_agent",
+                            lambda d: pytest.fail("agent must not run for a fresh verdict"))
+        assert service.evaluate_readiness(SNAPSHOT).reasoning == "stored"
+
+    def test_stale_verdict_triggers_a_fresh_agent_run(self, monkeypatch):
+        monkeypatch.setattr(service.cache, "get_verdict",
+                            lambda d, dt: self._stored(180))
+        monkeypatch.setattr(service.cache, "put_verdict", lambda *a: None)
+        monkeypatch.setattr(service, "evaluate_with_agent", lambda d: ReadinessEvaluation(
+            status="GROUNDED", score=30, reasoning="re-run", recommended_action="a",
+            risk_factors=[], circadian_note=""))
+        result = service.evaluate_readiness(SNAPSHOT)
+        assert result.reasoning == "re-run"
+        assert result.evaluated_at is not None
+
+    def test_fresh_agent_verdict_is_stamped(self, monkeypatch):
+        monkeypatch.setattr(service.cache, "get_verdict", lambda *a: None)
+        monkeypatch.setattr(service.cache, "put_verdict", lambda *a: None)
+        monkeypatch.setattr(service, "evaluate_with_agent", lambda d: ReadinessEvaluation(
+            status="CLEAR", score=90, reasoning="r", recommended_action="a",
+            risk_factors=[], circadian_note=""))
+        assert service.evaluate_readiness(SNAPSHOT).evaluated_at is not None
