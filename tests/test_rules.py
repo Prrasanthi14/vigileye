@@ -7,6 +7,7 @@ from vigileye.scoring.rules import (
     FACTORS,
     TOTAL_WEIGHT,
     evaluate_with_rules,
+    reconcile,
     score_pilot,
     status_for,
 )
@@ -82,3 +83,55 @@ def test_worse_biometrics_never_score_higher():
 def test_reasoning_names_the_score():
     evaluation = evaluate_with_rules(WORST)
     assert str(evaluation.score) in evaluation.reasoning
+
+
+class TestMedicalHistory:
+    """The fallback must not judge a pilot with a sleep disorder as healthy."""
+
+    def test_a_condition_lowers_the_score_and_is_named(self):
+        score, risks, _ = score_pilot({**PERFECT, "medical_history": "Narcolepsy (Treated)"})
+        assert score < score_pilot(PERFECT)[0]
+        assert any("Narcolepsy" in r for r in risks)
+
+    @pytest.mark.parametrize("history", ["None", "", None])
+    def test_no_condition_means_no_penalty(self, history):
+        assert score_pilot({**PERFECT, "medical_history": history})[0] == score_pilot(PERFECT)[0]
+
+    def test_apnea_compounds_with_low_deep_sleep(self):
+        apnea = {**PERFECT, "medical_history": "Mild Sleep Apnea"}
+        penalty_good_deep = score_pilot(PERFECT)[0] - score_pilot(apnea)[0]
+        low_deep = {**PERFECT, "deep_sleep_pct": 10}
+        penalty_low_deep = score_pilot(low_deep)[0] - score_pilot({**low_deep, **apnea, "deep_sleep_pct": 10})[0]
+        assert penalty_low_deep > penalty_good_deep
+
+    def test_score_never_goes_negative(self):
+        assert score_pilot({**WORST, "medical_history": "Narcolepsy, Sleep Apnea, Insomnia"})[0] >= 0
+
+
+class TestReconcile:
+    """Gemini's label and score must never contradict; the stricter one wins."""
+
+    @pytest.mark.parametrize("status,score,expected", [
+        ("PENDING_TEST", 85, ("PENDING_TEST", 69)),   # cautious label kept, score moved into band
+        ("GROUNDED", 45, ("GROUNDED", 44)),
+        ("CLEAR", 30, ("GROUNDED", 30)),              # low score overrides a lenient label
+        ("CLEAR", 90, ("CLEAR", 90)),                 # already consistent: untouched
+        ("PENDING_TEST", 50, ("PENDING_TEST", 50)),
+    ])
+    def test_keeps_the_stricter_reading(self, status, score, expected):
+        assert reconcile(status, score) == expected
+
+    def test_every_combination_ends_consistent(self):
+        for status in ("CLEAR", "PENDING_TEST", "GROUNDED"):
+            for score in range(101):
+                final, adjusted = reconcile(status, score)
+                assert status_for(adjusted)[0] == final
+
+    def test_gemini_output_is_reconciled_and_keeps_its_action_when_label_holds(self):
+        from vigileye.models import ReadinessEvaluation
+        from vigileye.scoring.agent import _consistent
+
+        out = _consistent(ReadinessEvaluation(
+            status="PENDING_TEST", score=85, reasoning="r", recommended_action="Test first",
+            risk_factors=[], circadian_note=""))
+        assert (out.status, out.score, out.recommended_action) == ("PENDING_TEST", 69, "Test first")

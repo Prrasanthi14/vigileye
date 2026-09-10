@@ -51,14 +51,15 @@ class SQLiteConnector(DataConnector):
             return pd.read_sql_query(
                 """
                 WITH RankedReadings AS (
-                    SELECT p.driver_id, p.name, p.role, d.total_sleep_hours, d.hrv_ms,
+                    SELECT p.driver_id, p.name, p.role, p.medical_history,
+                           d.total_sleep_hours, d.hrv_ms,
                            d.report_time, d.consecutive_duty_days, d.deep_sleep_pct,
                            d.rem_sleep_pct, d.resting_hr, d.time_awake_since_last_sleep,
                            ROW_NUMBER() OVER(PARTITION BY p.driver_id ORDER BY d.date DESC) as rn
                     FROM pilots p
                     JOIN daily_readings d ON p.driver_id = d.driver_id
                 )
-                SELECT driver_id, name, role, total_sleep_hours, hrv_ms, report_time,
+                SELECT driver_id, name, role, medical_history, total_sleep_hours, hrv_ms, report_time,
                        consecutive_duty_days, deep_sleep_pct, rem_sleep_pct, resting_hr,
                        time_awake_since_last_sleep
                 FROM RankedReadings WHERE rn = 1

@@ -23,7 +23,7 @@ Wearable tracker  ──►  BigQuery  ──►  Readiness API  ──►  Gemi
 
 **Gemini** makes the call — one generative-AI call per pilot, over their complete data. It receives the pilot's latest biometrics plus a seven-day trend and medical history, and reasons against aviation fatigue-science context: the 02:00–05:00 Window of Circadian Low, healthy sleep architecture thresholds, HRV as a recovery signal, the point past which wakefulness degrades performance comparably to alcohol, and how a condition like sleep apnea amplifies an already-poor night.
 
-The **rules engine** is a deterministic weighted model over the same eight factors. It exists so the system degrades rather than fails when Gemini is unavailable — and every verdict records which engine produced it, so a fallback can never be presented as an AI decision.
+The **rules engine** is a deterministic weighted model over the same eight factors, plus a penalty for medical conditions on record. It exists so the system degrades rather than fails when Gemini is unavailable — and every verdict records which engine produced it, so a fallback can never be presented as an AI decision.
 
 ### What happens when you click a pilot
 
@@ -100,7 +100,7 @@ src/vigileye/
 │   └── sync.py            provider → BigQuery, upsert per pilot-day
 ├── scoring/
 │   ├── agent.py           Gemini, rate-limited to the per-model RPM quota
-│   ├── rules.py           deterministic 8-factor fallback
+│   ├── rules.py           deterministic fallback: 8 factors + medical history
 │   ├── cache.py           stored verdicts, keyed (pilot, reading date)
 │   └── service.py         Gemini → fallback, with provenance
 └── api/main.py          FastAPI

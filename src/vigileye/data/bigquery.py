@@ -74,7 +74,8 @@ class BigQueryConnector(DataConnector):
             return pd.DataFrame()
         query = f"""
             WITH RankedReadings AS (
-                SELECT p.driver_id, p.name, p.role, d.total_sleep_hours, d.hrv_ms,
+                SELECT p.driver_id, p.name, p.role, p.medical_history,
+                       d.total_sleep_hours, d.hrv_ms,
                        d.report_time, d.consecutive_duty_days, d.deep_sleep_pct,
                        d.rem_sleep_pct, d.resting_hr, d.time_awake_since_last_sleep,
                        ROW_NUMBER() OVER(PARTITION BY p.driver_id ORDER BY d.date DESC) as rn

@@ -73,6 +73,34 @@ FACTORS = (
 CIRCADIAN_WEIGHT = 0.10
 TOTAL_WEIGHT = sum(f.weight for f in FACTORS) + CIRCADIAN_WEIGHT
 
+# The fallback has to see what Gemini sees: a pilot with a sleep disorder on
+# record must not be scored as healthy just because Gemini is unavailable.
+# The points are a conservative heuristic, not clinical weights.
+MEDICAL_PENALTIES = (
+    ("narcolepsy", 12, "Narcolepsy on record"),
+    ("apnea", 10, "Sleep apnea on record"),
+    ("insomnia", 8, "History of insomnia on record"),
+    ("hypertension", 4, "Hypertension on record"),
+)
+LOW_DEEP_SLEEP_PCT = 13
+
+STATUS_RANK = {"CLEAR": 0, "PENDING_TEST": 1, "GROUNDED": 2}
+BAND_CEILING = {"CLEAR": 100, "PENDING_TEST": 69, "GROUNDED": 44}
+
+
+def _medical_penalty(data: dict[str, Any]) -> tuple[int, list[str]]:
+    history = str(data.get("medical_history") or "").lower()
+    penalty, risks = 0, []
+    for keyword, points, note in MEDICAL_PENALTIES:
+        if keyword in history:
+            penalty += points
+            risks.append(note)
+    # Apnea fragments deep sleep, so the two compound rather than simply add.
+    if "apnea" in history and float(data.get("deep_sleep_pct") or 0) < LOW_DEEP_SLEEP_PCT:
+        penalty += 5
+        risks.append("Sleep apnea compounded by low deep sleep")
+    return penalty, risks
+
 
 def _circadian(report_time: str) -> tuple[int, str | None, str]:
     """Score the report time against the Window of Circadian Low (02:00-05:00)."""
@@ -110,7 +138,11 @@ def score_pilot(data: dict[str, Any]) -> tuple[int, list[str], str]:
         risks.append(circadian_risk)
 
     # Weights total 1.05, not 1.0 — normalize so the score stays within 0-100.
-    return int(round(weighted / TOTAL_WEIGHT)), risks, note
+    score = int(round(weighted / TOTAL_WEIGHT))
+
+    penalty, medical_risks = _medical_penalty(data)
+    risks.extend(medical_risks)
+    return max(0, score - penalty), risks, note
 
 
 def status_for(score: int) -> tuple[str, str]:
@@ -119,6 +151,19 @@ def status_for(score: int) -> tuple[str, str]:
     if score >= 45:
         return "PENDING_TEST", "Administer PVT (Psychomotor Vigilance Test) before duty."
     return "GROUNDED", "Remove from duty. Minimum 8 hours continuous rest required."
+
+
+def reconcile(status: str, score: int) -> tuple[str, int]:
+    """Make a verdict's label and score agree, the stricter of the two winning.
+
+    Gemini chooses the label and the score separately and sometimes pairs a
+    cautious label with a score from a healthier band (PENDING_TEST at 85).
+    Keeping the stricter reading means a correction can never clear a pilot the
+    model wanted tested; the score moves to the edge of that band so the two
+    never contradict on screen.
+    """
+    final = max(status, status_for(score)[0], key=STATUS_RANK.__getitem__)
+    return final, min(score, BAND_CEILING[final])
 
 
 def evaluate_with_rules(data: dict[str, Any]) -> ReadinessEvaluation:

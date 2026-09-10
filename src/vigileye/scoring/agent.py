@@ -11,6 +11,7 @@ from typing import Any
 from ..config import settings
 from ..models import ReadinessEvaluation
 from . import usage
+from .rules import reconcile, status_for
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,12 @@ Key scientific principles:
   risk. Mild sleep apnea amplifies the danger of low deep sleep; if a condition is severe and the
   metrics are poor, ground the pilot.
 
+Verdict bands. The status MUST match the score:
+- CLEAR: score 70-100. Fit for duty.
+- PENDING_TEST: score 45-69. Borderline; the pilot takes a Psychomotor Vigilance Test.
+- GROUNDED: score 0-44. Unfit for duty.
+If you judge that a pilot should be tested or grounded, give a score inside that band.
+
 You receive a JSON payload of pilot schedule and biometric data. Analyse it and return JSON
 matching the requested schema exactly.
 """
@@ -74,6 +81,19 @@ def build_payload(data: dict[str, Any]) -> str:
     fields = {k: v for k, v in data.items() if k not in IDENTITY_FIELDS}
     # default=str so BigQuery DATE values serialize instead of raising.
     return json.dumps(fields, separators=(",", ":"), default=str)
+
+
+def _consistent(verdict: ReadinessEvaluation) -> ReadinessEvaluation:
+    """Guarantee the label and score agree, even if the model pairs them badly."""
+    status, score = reconcile(verdict.status, verdict.score)
+    if (status, score) == (verdict.status, verdict.score):
+        return verdict
+    logger.info("Reconciled Gemini verdict %s/%s -> %s/%s",
+                verdict.status, verdict.score, status, score)
+    update: dict[str, Any] = {"status": status, "score": score}
+    if status != verdict.status:
+        update["recommended_action"] = status_for(score)[1]
+    return verdict.model_copy(update=update)
 
 
 def evaluate_with_agent(data: dict[str, Any]) -> ReadinessEvaluation:
@@ -111,7 +131,7 @@ def evaluate_with_agent(data: dict[str, Any]) -> ReadinessEvaluation:
             response = client.models.generate_content(
                 model=settings.gemini_model, contents=contents, config=config
             )
-            verdict = ReadinessEvaluation.model_validate_json(response.text)
+            verdict = _consistent(ReadinessEvaluation.model_validate_json(response.text))
             usage.record_call(data.get("driver_id"), response.usage_metadata,
                               getattr(response, "model_version", None) or settings.gemini_model)
             return verdict
