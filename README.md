@@ -473,7 +473,7 @@ This refuses to run if the dataset already holds pilots, so it cannot overwrite 
 ### Running the tests
 
 ```bash
-pytest        # 65 tests
+pytest        # 88 tests
 ```
 
 No credentials, no network access and no model calls: the suite runs against SQLite with Gemini and the verdict store stubbed.
