@@ -115,16 +115,20 @@ with st.sidebar:
         key = f"{row.driver_id} - {row.name}"
         labels[key] = f"{badge.get(row.status, '')} {key}"
 
-    if query or status_filter:
+    filtering = bool(query or status_filter)
+    if filtering:
         st.caption(f"{len(matches)} of {len(fleet_df)} pilots match")
 
     if len(options) == 1:
         st.warning("No pilots match that search.")
         selected = "🏠 Fleet Command Center"
     else:
+        # Jump straight to a pilot only when the filter leaves exactly one.
+        # With several matches, stay on the fleet view so every match is visible
+        # in the table rather than silently landing on the first one.
         selected = st.selectbox(
             "Select pilot", options,
-            index=1 if (query or status_filter) and len(options) > 1 else 0,
+            index=1 if filtering and len(options) == 2 else 0,
             format_func=lambda opt: labels.get(opt, opt),
         )
 
@@ -138,10 +142,15 @@ with st.sidebar:
 
 if selected == "🏠 Fleet Command Center":
     st.markdown("## Fleet Overview (Latest Sync)")
-    st.caption(f"Readiness for {len(fleet_df)} pilots, scored by the same engine as the detail view")
+    if filtering:
+        st.caption(f"Showing {len(matches)} of {len(fleet_df)} pilots matching your filter")
+    else:
+        st.caption(f"Readiness for {len(fleet_df)} pilots, scored by the same engine as the detail view")
 
     icon = {"CLEAR": "✅ CLEAR", "PENDING_TEST": "🟡 PENDING", "GROUNDED": "🔴 GROUNDED"}
-    grid = fleet_df.assign(Status=fleet_df["status"].map(icon))[
+    # The table shows the filtered set: filtering only the sidebar dropdown
+    # left the grid showing all 100 pilots, which read as the filter doing nothing.
+    grid = matches.assign(Status=matches["status"].map(icon))[
         ["driver_id", "name", "role", "Status", "score",
          "total_sleep_hours", "hrv_ms", "consecutive_duty_days"]
     ]

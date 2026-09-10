@@ -156,13 +156,18 @@ def delete_pilot(driver_id: str) -> dict:
 
 
 @router.post("/pilots/{driver_id}/evaluate", response_model=Evaluation)
-def evaluate(driver_id: str) -> Evaluation:
-    return evaluate_readiness(_pilot_payload(driver_id)["snapshot"])
+def evaluate(driver_id: str, refresh: bool = Query(default=False)) -> Evaluation:
+    """Fetch this pilot's current readings and return a go/no-go verdict.
+
+    Always reads the latest row the tracker has landed. A verdict already held
+    for that same reading is reused; `?refresh=true` forces a fresh agent run.
+    """
+    return evaluate_readiness(_pilot_payload(driver_id)["snapshot"], use_cache=not refresh)
 
 
 @router.post("/pilots/{driver_id}/pvt")
 def pvt(driver_id: str) -> dict:
-    return simulate_pvt_test(evaluate(driver_id).score)
+    return simulate_pvt_test(evaluate(driver_id, refresh=False).score)
 
 
 app.include_router(router)
