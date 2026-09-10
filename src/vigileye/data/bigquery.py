@@ -1,6 +1,7 @@
 """BigQuery-backed pilot data access."""
 
 import logging
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -28,7 +29,8 @@ class BigQueryConnector(DataConnector):
     def _run(self, query: str, **params: Any):
         from google.cloud import bigquery
 
-        type_for = {str: "STRING", int: "INT64", float: "FLOAT64"}
+        type_for = {str: "STRING", int: "INT64", float: "FLOAT64",
+                    bool: "BOOL", date: "DATE"}
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter(k, type_for[type(v)], v)
@@ -54,12 +56,16 @@ class BigQueryConnector(DataConnector):
     def get_pilot_history(self, driver_id: str, days: int = 30) -> pd.DataFrame:
         if not self.client:
             return pd.DataFrame()
+        # Take the most recent `days` rows, then return them oldest-first for
+        # plotting. Ordering ASC before LIMIT would return the oldest window.
         query = f"""
-            SELECT {HISTORY_COLUMNS}
-            FROM {self._table('daily_readings')}
-            WHERE driver_id = @driver_id
-            ORDER BY date ASC
-            LIMIT @days
+            SELECT * FROM (
+                SELECT {HISTORY_COLUMNS}
+                FROM {self._table('daily_readings')}
+                WHERE driver_id = @driver_id
+                ORDER BY date DESC
+                LIMIT @days
+            ) ORDER BY date ASC
         """
         return self._run(query, driver_id=driver_id, days=days).to_dataframe()
 
@@ -78,6 +84,50 @@ class BigQueryConnector(DataConnector):
             SELECT * EXCEPT(rn) FROM RankedReadings WHERE rn = 1
         """
         return self.client.query(query).to_dataframe()
+
+    def pilot_exists(self, driver_id: str) -> bool:
+        query = f"SELECT 1 FROM {self._table('pilots')} WHERE driver_id = @driver_id LIMIT 1"
+        return any(self._run(query, driver_id=driver_id).result())
+
+    def create_pilot(self, pilot: dict[str, Any]) -> None:
+        query = f"""
+            INSERT INTO {self._table('pilots')}
+                (driver_id, name, role, shift_type, base_timezone, medical_history)
+            VALUES (@driver_id, @name, @role, @shift_type, @base_timezone, @medical_history)
+        """
+        self._run(query, **pilot).result()
+
+    def update_pilot(self, driver_id: str, fields: dict[str, Any]) -> None:
+        assignments = ", ".join(f"{key} = @{key}" for key in fields)
+        query = f"""
+            UPDATE {self._table('pilots')} SET {assignments}
+            WHERE driver_id = @driver_id
+        """
+        self._run(query, driver_id=driver_id, **fields).result()
+
+    def delete_pilot(self, driver_id: str) -> None:
+        for table in ("daily_readings", "pilots"):
+            self._run(
+                f"DELETE FROM {self._table(table)} WHERE driver_id = @driver_id",
+                driver_id=driver_id,
+            ).result()
+
+    def upsert_reading(self, driver_id: str, reading: dict[str, Any]) -> None:
+        # Delete-then-insert rather than MERGE: the source table has an `id`
+        # column the API does not populate, which MERGE would have to invent.
+        self._run(
+            f"DELETE FROM {self._table('daily_readings')} "
+            "WHERE driver_id = @driver_id AND date = @date",
+            driver_id=driver_id, date=reading["date"],
+        ).result()
+
+        columns = ["driver_id", *reading.keys()]
+        placeholders = ", ".join(f"@{c}" for c in columns)
+        query = f"""
+            INSERT INTO {self._table('daily_readings')} ({', '.join(columns)})
+            VALUES ({placeholders})
+        """
+        self._run(query, driver_id=driver_id, **reading).result()
 
     def get_source_name(self) -> str:
         return "Google BigQuery"

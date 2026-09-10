@@ -34,10 +34,13 @@ class SQLiteConnector(DataConnector):
 
     def get_pilot_history(self, driver_id: str, days: int = 30) -> pd.DataFrame:
         with self._get_conn() as conn:
+            # Most recent `days` rows, returned oldest-first for plotting.
             return pd.read_sql_query(
                 f"""
-                SELECT {HISTORY_COLUMNS} FROM daily_readings
-                WHERE driver_id = ? ORDER BY date ASC LIMIT ?
+                SELECT * FROM (
+                    SELECT {HISTORY_COLUMNS} FROM daily_readings
+                    WHERE driver_id = ? ORDER BY date DESC LIMIT ?
+                ) ORDER BY date ASC
                 """,
                 conn,
                 params=(driver_id, days),
@@ -61,6 +64,49 @@ class SQLiteConnector(DataConnector):
                 FROM RankedReadings WHERE rn = 1
                 """,
                 conn,
+            )
+
+    def pilot_exists(self, driver_id: str) -> bool:
+        with self._get_conn() as conn:
+            return conn.execute(
+                "SELECT 1 FROM pilots WHERE driver_id = ? LIMIT 1", (driver_id,)
+            ).fetchone() is not None
+
+    def create_pilot(self, pilot: dict[str, Any]) -> None:
+        columns = ", ".join(pilot)
+        placeholders = ", ".join("?" for _ in pilot)
+        with self._get_conn() as conn:
+            conn.execute(
+                f"INSERT INTO pilots ({columns}) VALUES ({placeholders})",
+                tuple(pilot.values()),
+            )
+
+    def update_pilot(self, driver_id: str, fields: dict[str, Any]) -> None:
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        with self._get_conn() as conn:
+            conn.execute(
+                f"UPDATE pilots SET {assignments} WHERE driver_id = ?",
+                (*fields.values(), driver_id),
+            )
+
+    def delete_pilot(self, driver_id: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM daily_readings WHERE driver_id = ?", (driver_id,))
+            conn.execute("DELETE FROM pilots WHERE driver_id = ?", (driver_id,))
+
+    def upsert_reading(self, driver_id: str, reading: dict[str, Any]) -> None:
+        row = {"driver_id": driver_id, **reading}
+        row["date"] = str(row["date"])
+        columns = ", ".join(row)
+        placeholders = ", ".join("?" for _ in row)
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM daily_readings WHERE driver_id = ? AND date = ?",
+                (driver_id, row["date"]),
+            )
+            conn.execute(
+                f"INSERT INTO daily_readings ({columns}) VALUES ({placeholders})",
+                tuple(row.values()),
             )
 
     def get_source_name(self) -> str:

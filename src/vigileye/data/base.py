@@ -33,6 +33,26 @@ class DataConnector(ABC):
         """Latest reading per pilot across the fleet."""
 
     @abstractmethod
+    def pilot_exists(self, driver_id: str) -> bool:
+        ...
+
+    @abstractmethod
+    def create_pilot(self, pilot: dict[str, Any]) -> None:
+        ...
+
+    @abstractmethod
+    def update_pilot(self, driver_id: str, fields: dict[str, Any]) -> None:
+        """Apply a partial roster update. `fields` must be non-empty."""
+
+    @abstractmethod
+    def delete_pilot(self, driver_id: str) -> None:
+        """Remove a pilot and their readings."""
+
+    @abstractmethod
+    def upsert_reading(self, driver_id: str, reading: dict[str, Any]) -> None:
+        """Insert or replace one pilot-day of biometrics."""
+
+    @abstractmethod
     def get_source_name(self) -> str:
         ...
 

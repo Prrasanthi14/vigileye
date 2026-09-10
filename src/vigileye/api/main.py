@@ -3,11 +3,11 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Query
 
 from ..config import settings
 from ..data import get_connector
-from ..models import Evaluation
+from ..models import Evaluation, PilotCreate, PilotUpdate
 from ..scoring import cache
 from ..scoring.rules import score_pilot, status_for
 from ..scoring.service import evaluate_readiness, simulate_pvt_test
@@ -89,14 +89,16 @@ def evaluate_fleet(limit: int = 100, workers: int = 6) -> dict:
     return {"evaluated": evaluated, "already_current": already_current, "agent_failed": failed}
 
 
-@router.get("/pilots/{driver_id}")
-def pilot(driver_id: str) -> dict:
+def _pilot_payload(driver_id: str, days: int = 30) -> dict:
+    """Snapshot + history. A plain function, so other routes can reuse it —
+    calling a route directly would pass FastAPI's Query object as `days`.
+    """
     connector = get_connector()
     data = connector.fetch_latest_data(driver_id)
     if not data:
         raise HTTPException(status_code=404, detail=f"No data for pilot {driver_id}")
 
-    history = connector.get_pilot_history(driver_id, days=30)
+    history = connector.get_pilot_history(driver_id, days=days)
     recent = history.tail(7)
     if not recent.empty:
         data["seven_day_avg_sleep"] = round(float(recent["total_sleep_hours"].mean()), 1)
@@ -105,9 +107,57 @@ def pilot(driver_id: str) -> dict:
     return {"snapshot": data, "history": history.to_dict("records")}
 
 
+@router.get("/pilots/{driver_id}")
+def pilot(driver_id: str, days: int = Query(default=30, ge=1, le=365)) -> dict:
+    """Latest snapshot plus `days` of history (e.g. ?days=7 for one week)."""
+    return _pilot_payload(driver_id, days)
+
+
+@router.post("/pilots", status_code=201)
+def create_pilot(pilot: PilotCreate) -> dict:
+    connector = get_connector()
+    if connector.pilot_exists(pilot.driver_id):
+        raise HTTPException(status_code=409, detail=f"Pilot {pilot.driver_id} already exists")
+    connector.create_pilot(pilot.model_dump())
+    return {"created": pilot.driver_id}
+
+
+@router.patch("/pilots/{driver_id}")
+def update_pilot(driver_id: str, update: PilotUpdate) -> dict:
+    connector = get_connector()
+    if not connector.pilot_exists(driver_id):
+        raise HTTPException(status_code=404, detail=f"Pilot {driver_id} not found")
+
+    fields = update.model_dump(exclude_unset=True, exclude_none=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No fields supplied to update")
+
+    connector.update_pilot(driver_id, fields)
+    # Medical history and shift type feed the verdict, so it is no longer valid.
+    cache.invalidate(driver_id)
+    return {"updated": driver_id, "fields": sorted(fields), "verdicts_invalidated": True}
+
+
+@router.delete("/pilots/{driver_id}")
+def delete_pilot(driver_id: str) -> dict:
+    connector = get_connector()
+    if not connector.pilot_exists(driver_id):
+        raise HTTPException(status_code=404, detail=f"Pilot {driver_id} not found")
+    connector.delete_pilot(driver_id)
+    cache.invalidate(driver_id)
+    return {"deleted": driver_id}
+
+
+# NOTE: there is deliberately no endpoint to write or edit biometric readings.
+# Readings are evidence for a go/no-go call, so a human-facing write path would
+# let an official clear a grounded pilot by editing the evidence. Readings enter
+# only through the ingestion pipeline (vigileye.ingestion), which runs as a job
+# under GCP credentials and records the source of every row.
+
+
 @router.post("/pilots/{driver_id}/evaluate", response_model=Evaluation)
 def evaluate(driver_id: str) -> Evaluation:
-    return evaluate_readiness(pilot(driver_id)["snapshot"])
+    return evaluate_readiness(_pilot_payload(driver_id)["snapshot"])
 
 
 @router.post("/pilots/{driver_id}/pvt")

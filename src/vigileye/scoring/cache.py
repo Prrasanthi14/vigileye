@@ -110,6 +110,27 @@ def put_verdict(driver_id: str, reading_date: date, evaluation: Evaluation) -> N
         logger.warning("Verdict cache write failed: %s", exc)
 
 
+def invalidate(driver_id: str, reading_date: date | None = None) -> None:
+    """Drop stored verdicts for a pilot.
+
+    Called whenever a pilot's biometrics or roster change: the stored verdict
+    describes data that no longer exists, and serving it would show a go/no-go
+    call that was never made about the current readings.
+    """
+    from google.cloud import bigquery
+
+    query = f"DELETE FROM `{_table_id()}` WHERE driver_id = @driver_id"
+    params = [bigquery.ScalarQueryParameter("driver_id", "STRING", driver_id)]
+    if reading_date:
+        query += " AND reading_date = @reading_date"
+        params.append(bigquery.ScalarQueryParameter("reading_date", "DATE", reading_date))
+
+    try:
+        _client().query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+    except Exception as exc:
+        logger.warning("Verdict invalidation failed: %s", exc)
+
+
 def get_fleet_verdicts() -> dict[str, dict]:
     """Latest stored verdict per pilot, keyed by driver_id."""
     query = f"""

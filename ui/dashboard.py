@@ -89,10 +89,44 @@ with st.sidebar:
     st.divider()
 
     fleet_df = get_fleet()
+
+    query = st.text_input("🔎 **Search pilot**", placeholder="Name or ID, e.g. PAT-004 or Casey")
+    status_filter = st.multiselect(
+        "Filter by status", ["GROUNDED", "PENDING_TEST", "CLEAR"],
+        default=[], placeholder="Any status",
+    )
+
+    matches = fleet_df
+    if query:
+        text = query.strip().lower()
+        matches = matches[
+            matches["driver_id"].str.lower().str.contains(text, na=False)
+            | matches["name"].str.lower().str.contains(text, na=False)
+        ]
+    if status_filter:
+        matches = matches[matches["status"].isin(status_filter)]
+
+    badge = {"CLEAR": "✅", "PENDING_TEST": "🟡", "GROUNDED": "🔴"}
     options = ["🏠 Fleet Command Center"] + [
-        f"{row.driver_id} - {row.name}" for row in fleet_df.itertuples()
+        f"{row.driver_id} - {row.name}" for row in matches.itertuples()
     ]
-    selected = st.selectbox("🔎 **Search or Select Pilot**", options, index=0)
+    labels = {opt: opt for opt in options}
+    for row in matches.itertuples():
+        key = f"{row.driver_id} - {row.name}"
+        labels[key] = f"{badge.get(row.status, '')} {key}"
+
+    if query or status_filter:
+        st.caption(f"{len(matches)} of {len(fleet_df)} pilots match")
+
+    if len(options) == 1:
+        st.warning("No pilots match that search.")
+        selected = "🏠 Fleet Command Center"
+    else:
+        selected = st.selectbox(
+            "Select pilot", options,
+            index=1 if (query or status_filter) and len(options) > 1 else 0,
+            format_func=lambda opt: labels.get(opt, opt),
+        )
 
     st.divider()
     engine = "🧠 AI agent" if health.get("agent_key_configured") else "📐 Rules engine"
