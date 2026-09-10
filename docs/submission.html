@@ -1,0 +1,178 @@
+<meta charset="utf-8">
+<title>VigilEye — Submission Document</title>
+<style>
+  body {
+    font-family: Arial, "Helvetica Neue", Helvetica, sans-serif;
+    font-size: 11pt; line-height: 1.5; color: #000;
+    max-width: 800px; margin: 0 auto; padding: 48px 32px; background: #fff;
+  }
+  h1 { font-size: 20pt; font-weight: 700; margin: 0 0 6px; }
+  h2 { font-size: 15pt; font-weight: 700; margin: 30px 0 10px;
+       padding-top: 14px; border-top: 1px solid #d0d0d0; }
+  h3 { font-size: 12.5pt; font-weight: 700; margin: 20px 0 6px; }
+  p { margin: 0 0 11px; }
+  ul { margin: 0 0 12px; padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0 16px; }
+  th, td { border: 1px solid #999; padding: 7px 10px; text-align: left;
+           font-size: 10.5pt; vertical-align: top; }
+  th { background: #f0f0f0; font-weight: 700; }
+  blockquote { margin: 12px 0; padding: 10px 16px; border-left: 3px solid #F5A623;
+               background: #fdf8ef; }
+  code { font-family: "Courier New", monospace; font-size: 10pt; }
+  .lead { color: #444; margin-bottom: 20px; }
+  .placeholder { border: 2px dashed #999; padding: 28px; text-align: center;
+                 color: #666; margin: 16px 0; font-style: italic; }
+</style>
+
+<h1>VigilEye — GenAI Fatigue Risk Decision Support for Pilots</h1>
+<p class="lead">
+  <b>Live demo:</b> https://vigileye-dashboard-969488392244.us-central1.run.app<br>
+  <b>Source code:</b> https://github.com/Prrasanthi14/vigileye
+</p>
+
+<h2>1. Project Description</h2>
+
+<p>VigilEye is a generative-AI (GenAI) decision-support system that assesses whether a pilot is fit to fly, using biometric data from their wearable tracker.</p>
+
+<p>A pilot flying several legs in a day accumulates fatigue that a duty-hours table cannot see. Two pilots can both be within their legal duty limits while being in completely different physiological states — one rested, one running a five-hour sleep debt on the sixth consecutive duty day. Regulation counts hours. VigilEye reads the body.</p>
+
+<p>The system pulls each pilot's overnight wearable data — total sleep, sleep staging (deep and REM percentages), heart-rate variability, resting heart rate, hours awake since last sleep, and consecutive duty days — into BigQuery. When a readiness decision is needed, Google's Gemini Pro model evaluates that pilot against aviation fatigue science and returns one of three verdicts with written reasoning:</p>
+
+<table>
+  <tr><th>Verdict</th><th>Score</th><th>Meaning</th></tr>
+  <tr><td>CLEAR</td><td>70–100</td><td>Fit for duty</td></tr>
+  <tr><td>PENDING_TEST</td><td>45–69</td><td>Borderline — administer a Psychomotor Vigilance Test; the result decides</td></tr>
+  <tr><td>GROUNDED</td><td>0–44</td><td>Unfit. Mandatory rest before returning to duty</td></tr>
+</table>
+
+<p><b>This is decision support, not autonomous decision-making.</b> VigilEye surfaces risk and the reasoning behind it for a human fatigue officer or crew scheduler, who makes the operational call. Grounding a pilot is a regulated act, and the system is deliberately designed to inform that judgement rather than replace it. The PENDING_TEST verdict makes this explicit: rather than guessing on a borderline pilot, the system escalates to an objective, human-administered cognitive test.</p>
+
+<h3>What Gemini actually reasons about</h3>
+
+<p>Gemini receives the pilot's latest biometrics, a seven-day trend, and their medical history, and evaluates against established fatigue-science context:</p>
+
+<ul>
+  <li><b>Window of Circadian Low (WOCL)</b> — alertness bottoms out between 02:00 and 05:00. Reporting for duty inside this window is an independent risk factor regardless of sleep quality.</li>
+  <li><b>Sleep architecture</b> — healthy deep sleep exceeds 13% and REM exceeds 15%. Seven hours of poorly structured sleep is not equivalent to seven hours of good sleep.</li>
+  <li><b>Heart-rate variability</b> — a recovery signal. Below roughly 35 ms indicates poor recovery or accumulated stress, interpreted against that individual pilot's own baseline.</li>
+  <li><b>Extended wakefulness</b> — beyond 16–17 hours awake, performance degrades comparably to alcohol intoxication.</li>
+  <li><b>Acute versus chronic fatigue</b> — a single bad night is treated differently from a seven-day average below six hours. Chronic restriction amplifies the risk of any acute loss.</li>
+  <li><b>Medical history</b> — conditions such as sleep apnea or insomnia raise assessed risk. Mild apnea amplifies the danger of already-low deep sleep.</li>
+</ul>
+
+<p>A representative verdict produced by the system:</p>
+
+<blockquote>
+  <p><b>GROUNDED — score 25.</b> "Critical fatigue risk identified. The driver suffers from both acute (4.76 hours) and chronic (5.8 hours 7-day average) sleep deprivation. Sleep architecture is poor, and an HRV of 22.6 ms indicates lack of recovery. With 15.6 hours already awake, the driver is approaching the 16–17 hour threshold where performance degradation equals alcohol impairment."</p>
+  <p><i>Recommended action: Ground immediately. Require a mandatory uninterrupted rest period of at least 10 to 12 hours.</i></p>
+</blockquote>
+
+<h3>Reliability by design</h3>
+
+<p>Three decisions distinguish this from a wrapper around a model call:</p>
+
+<p><b>Every verdict states which engine produced it.</b> If Gemini is unavailable — no API key, exhausted quota, an outage — a deterministic rules engine (eight biometric factors plus medical history) answers instead, so the system degrades rather than fails. Critically, that fallback is never disguised: each verdict carries a source field (agent or rules) and, where relevant, the reason Gemini could not run. The dashboard renders it under a different heading with a visible warning. In a safety system, a verdict you cannot attribute is worse than no verdict at all.</p>
+
+<p><b>Biometric readings cannot be edited through the application.</b> There is deliberately no API endpoint that writes or modifies a reading. Readings are the evidence behind a go/no-go call — an official able to edit a pilot's HRV could clear a grounded pilot by altering the evidence rather than challenging the verdict. Data enters only through the ingestion pipeline, which runs as an operator job under cloud credentials.</p>
+
+<p><b>A verdict is a stored fact about specific data, not a recomputation.</b> Verdicts are keyed to a pilot and a reading date, so the fleet view and the individual pilot view can never disagree. Any change to the underlying data invalidates the verdict, and verdicts expire after two hours, because hours-awake climbs with the clock whether or not the stored reading changes.</p>
+
+<h2>2. Project Use Case</h2>
+
+<h3>The problem</h3>
+
+<p>Fatigue is one of the most persistent contributors to aviation and commercial-transport safety incidents, and the hardest to manage. Current practice is largely regulatory: maximum duty hours, minimum rest periods, cumulative limits. These are necessary but blunt. They assume that time off duty equals rest, which is false for a pilot who slept four hours in a hotel before a 03:30 report time, or one carrying a week-long sleep debt across a multi-leg rotation.</p>
+
+<p>Self-reporting does not close the gap. Pilots are poor judges of their own impairment — one of the documented effects of fatigue is reduced insight into being fatigued — and there is a real disincentive to declare oneself unfit.</p>
+
+<h3>Who uses it</h3>
+
+<p><b>Crew schedulers and fleet managers</b> open the fleet view before a duty period. Pilots are sorted risk-first, so anyone who cannot fly appears at the top rather than buried among cleared crew. This answers the operational question directly: who on today's roster needs attention.</p>
+
+<p><b>Fatigue risk officers and aeromedical staff</b> open an individual pilot to see the full assessment — the verdict, Gemini's written reasoning, the specific risk factors identified, and thirty days of sleep and HRV trend. The reasoning matters as much as the verdict: an officer overriding or acting on a recommendation needs to see what it was based on.</p>
+
+<p><b>Pilots themselves</b>, in a production deployment with role-based access, would see their own readiness and trend — turning the system into a personal fatigue-management aid rather than only a supervisory tool.</p>
+
+<h3>Where it fits operationally</h3>
+
+<p>VigilEye sits between the wearable and the roster. It does not replace duty-hour regulation; it adds a physiological layer that regulation cannot observe. A pilot who is legal on paper but physiologically impaired is exactly the case current systems miss, and exactly the case this surfaces.</p>
+
+<p>The escalation path is deliberate. A CLEAR verdict requires no action. A GROUNDED verdict is a strong recommendation backed by explicit reasoning that a human reviews. A PENDING_TEST verdict does not guess — it routes the pilot to a Psychomotor Vigilance Test, an established objective measure of reaction time and attention lapses, and the test result decides.</p>
+
+<h3>Beyond aviation</h3>
+
+<p>The same model applies wherever fatigue is a regulated safety risk and wearables are already common: long-haul commercial drivers (the current dataset includes CDL driver roles), rail operators, maritime crews, and hospital shift staff. The scoring factors are aviation-tuned but the architecture is domain-agnostic.</p>
+
+<h3>Current status and honest limitations</h3>
+
+<p>The system is deployed and fully functional end to end. Every component described here works: real BigQuery storage, real Gemini Pro reasoning, real verdicts, a live dashboard, 65 automated tests.</p>
+
+<p>What it is not, stated plainly:</p>
+
+<ul>
+  <li><b>The biometric data is synthetic.</b> It is physiologically modelled — day-to-day persistence, accumulating sleep debt, per-pilot baselines, sleep apnea suppressing deep sleep, reproducing a sleep-to-HRV correlation of about 0.47, within the range seen in real wearable data — but it is generated, not measured. A Google Fit integration was the original plan; that API is closed to new developers and shuts down at the end of 2026, so ingestion was built against a vendor-neutral interface with an Oura adapter instead.</li>
+  <li><b>The scoring weights are not clinically validated.</b> They are informed by published fatigue-science thresholds but have not been validated against incident data or reviewed by aeromedical professionals. That validation is a prerequisite for operational use.</li>
+  <li><b>The Psychomotor Vigilance Test is simulated</b>, demonstrating the escalation path rather than administering a real test.</li>
+</ul>
+
+<p>These are the reasons the system is positioned as decision support. It is a working demonstration of how generative-AI reasoning over wearable biometrics can inform fitness-for-duty decisions — not a certified system for making them.</p>
+
+<h2>3. Architecture</h2>
+
+<h3>Technology stack</h3>
+
+<table>
+  <tr><th>Layer</th><th>Technology</th></tr>
+  <tr><td>Reasoning</td><td>Google Gemini Pro (gemini-pro-latest)</td></tr>
+  <tr><td>Backend</td><td>Python 3.12, FastAPI, deployed on Google Cloud Run</td></tr>
+  <tr><td>Data</td><td>Google BigQuery</td></tr>
+  <tr><td>Frontend</td><td>Streamlit, deployed on Google Cloud Run</td></tr>
+  <tr><td>Ingestion</td><td>Vendor-neutral provider interface (Oura v2 adapter; synthetic generator)</td></tr>
+</table>
+
+<h3>System architecture</h3>
+
+<div class="placeholder">Insert the architecture diagram image here<br>(Insert → Image → Upload from computer)</div>
+
+<h3>How a decision flows</h3>
+
+<ol>
+  <li>A wearable tracker's data is ingested into BigQuery. Ingestion is the only writer of biometric readings, and it upserts per pilot-day so a corrected reading replaces rather than duplicates the original.</li>
+  <li>A scheduler or fatigue officer opens a pilot in the dashboard.</li>
+  <li>The dashboard calls the readiness API, authenticating with a Cloud Run identity token.</li>
+  <li>The API reads that pilot's latest reading and seven-day trend from BigQuery.</li>
+  <li>If a verdict already exists for that reading and is under two hours old, it is returned directly (approximately 2 seconds).</li>
+  <li>Otherwise the Gemini Pro evaluates the pilot (approximately 21 seconds) and the verdict is stored.</li>
+  <li>If Gemini cannot run, the deterministic rules engine answers instead, and the result is labelled as such with the reason.</li>
+  <li>The dashboard displays the verdict, the reasoning, the risk factors, and which engine produced it.</li>
+</ol>
+
+<h3>Deployment topology</h3>
+
+<p>Two Cloud Run services, deliberately separated:</p>
+
+<ul>
+  <li><b>vigileye-api</b> — private, reachable only by the dashboard's service account. It serves biometric and medical data, so it is closed to anonymous callers. Requesting it directly returns HTTP 403.</li>
+  <li><b>vigileye-dashboard</b> — public. Holds no decision logic; it is a client of the API.</li>
+</ul>
+
+<p>This separation means the two halves scale independently, and pilot health data is never exposed on a public endpoint.</p>
+
+<h3>Design characteristics</h3>
+
+<p><b>Scalability.</b> The API is stateless, so Cloud Run scales it horizontally and to zero when idle. Because verdicts are stored per pilot-day, the model is called once per pilot per day rather than once per page view — viewing the fleet dashboard repeatedly costs nothing. A whole-fleet sweep of 100 pilots takes five minutes; at airline scale (5,000+ pilots) the design shifts to evaluating each pilot shortly before their report time, which spreads the same work across the day and touches only pilots actually flying.</p>
+
+<p><b>Latency.</b> A stored verdict returns in about 2 seconds against about 21 seconds for a fresh Gemini evaluation. The fleet view makes no model calls at all. Verdicts expire after two hours so that a decision is never made on a stale assessment.</p>
+
+<p><b>Rate limiting.</b> Gemini Pro permits 25 requests per minute. Calls are paced below that quota by a thread-safe sliding window, and quota-exhausted responses are retried with backoff. Without this, a concurrent fleet evaluation exhausted the quota and silently degraded most of the fleet to the rules engine.</p>
+
+<p><b>Fault tolerance.</b> The system degrades rather than fails: if Gemini is unavailable the rules engine answers, storage failures are contained rather than crashing the service, and degraded verdicts are never cached so Gemini is retried on the next request.</p>
+
+<p><b>Consistency.</b> One scoring path and one stored verdict per pilot-day, read by both the fleet view and the pilot view, so the two can never contradict each other.</p>
+
+<h3>Testing</h3>
+
+<p>VigilEye has <b>88 automated tests</b>, all passing. They cover the scoring engine and its boundaries, the API contract (including the rule that no request can edit a biometric reading), how verdicts are labelled, reused and expired, and token accounting. They run locally with no cloud credentials and no model calls. The system was also verified end to end against the live deployment.</p>
+
+<p><b>For the full test breakdown, the live verification results and step-by-step instructions to run it yourself, see the README on GitHub:</b> <a href="https://github.com/Prrasanthi14/vigileye#testing">github.com/Prrasanthi14/vigileye#testing</a></p>

@@ -1,0 +1,175 @@
+<meta charset="utf-8">
+<title>VigilEye Architecture</title>
+<style>
+  :root {
+    --ink: #10151f;
+    --muted: #5b6577;
+    --line: #c9d2e0;
+    --amber: #F5A623;
+    --amber-soft: #FEF6E7;
+    --teal: #00998A;
+    --teal-soft: #E6F5F3;
+    --slate: #334155;
+    --slate-soft: #EEF2F7;
+    --red: #D6455D;
+    --red-soft: #FCEDF0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: #fff;
+    color: var(--ink);
+    font: 15px/1.5 "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 22px;
+    display: flex;
+    justify-content: center;
+  }
+  .sheet { width: 1040px; }
+  h1 { font-size: 21px; margin: 0 0 3px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+
+  .band { margin-bottom: 4px; }
+  .band-label {
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 5px;
+  }
+  .row { display: flex; align-items: stretch; gap: 14px; }
+
+  .box {
+    border: 1.5px solid var(--line); border-radius: 10px;
+    padding: 10px 13px; background: #fff; flex: 1; min-width: 0;
+  }
+  .box .t { font-weight: 650; font-size: 13.5px; margin-bottom: 2px; }
+  .box .d { font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+  .box .tag {
+    display: inline-block; font-size: 10.5px; font-weight: 650;
+    padding: 2px 7px; border-radius: 4px; margin-top: 7px;
+  }
+
+  .amber { border-color: var(--amber); background: var(--amber-soft); }
+  .amber .tag { background: var(--amber); color: #3a2600; }
+  .teal { border-color: var(--teal); background: var(--teal-soft); }
+  .teal .tag { background: var(--teal); color: #fff; }
+  .slate { border-color: var(--slate); background: var(--slate-soft); }
+  .slate .tag { background: var(--slate); color: #fff; }
+  .red { border-color: var(--red); background: var(--red-soft); }
+  .red .tag { background: var(--red); color: #fff; }
+
+  .arrow {
+    text-align: center; color: var(--muted); font-size: 14px;
+    margin: 3px 0; letter-spacing: 0.3em;
+  }
+  .arrow .note {
+    display: block; font-size: 11px; letter-spacing: 0; margin-top: 1px;
+  }
+
+  .verdicts { display: flex; gap: 12px; margin-top: 4px; }
+  .v {
+    flex: 1; border-radius: 9px; padding: 9px 12px; color: #fff;
+  }
+  .v .n { font-weight: 700; font-size: 14px; letter-spacing: 0.02em; }
+  .v .m { font-size: 12px; opacity: 0.93; margin-top: 2px; }
+  .v-clear { background: var(--teal); }
+  .v-pend { background: var(--amber); color: #3a2600; }
+  .v-ground { background: var(--red); }
+
+  .note-strip {
+    margin-top: 14px; border-left: 3px solid var(--amber);
+    background: #fbfcfe; padding: 10px 14px; border-radius: 0 8px 8px 0;
+  }
+  .note-strip b { font-weight: 650; }
+  .note-strip p { margin: 0 0 5px; font-size: 11.5px; color: var(--slate); }
+  .note-strip p:last-child { margin-bottom: 0; }
+</style>
+
+<div class="sheet">
+  <h1>VigilEye — System Architecture</h1>
+  <div class="sub">Agentic fatigue risk decision support · Google Cloud</div>
+
+  <div class="band">
+    <div class="band-label">1 · Data sources</div>
+    <div class="row">
+      <div class="box">
+        <div class="t">Wearable trackers</div>
+        <div class="d">Sleep duration &amp; staging, HRV, resting heart rate, hours awake</div>
+      </div>
+      <div class="box">
+        <div class="t">Crew roster</div>
+        <div class="d">Report times, shift type, consecutive duty days, medical history</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow">↓<span class="note">Ingestion pipeline — the only writer of biometric readings</span></div>
+
+  <div class="band">
+    <div class="band-label">2 · Storage</div>
+    <div class="row">
+      <div class="box amber">
+        <div class="t">Google BigQuery</div>
+        <div class="d"><code>pilots</code> · <code>daily_readings</code> · <code>readiness_verdicts</code><br>
+          One row per pilot per day; corrected readings replace rather than duplicate</div>
+        <span class="tag">GCP</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow">↓</div>
+
+  <div class="band">
+    <div class="band-label">3 · Readiness API — Cloud Run (private)</div>
+    <div class="row">
+      <div class="box teal">
+        <div class="t">Gemini Pro agent</div>
+        <div class="d">Reasons over WOCL, sleep architecture, HRV recovery, acute vs chronic fatigue, medical history</div>
+        <span class="tag">PRIMARY</span>
+      </div>
+      <div class="box slate">
+        <div class="t">Rules engine</div>
+        <div class="d">Deterministic 8-factor weighted model. Answers when the agent cannot, so the system degrades rather than fails</div>
+        <span class="tag">FALLBACK</span>
+      </div>
+      <div class="box">
+        <div class="t">Verdict store</div>
+        <div class="d">Keyed to pilot + reading date. Reused for 2 hours, then re-evaluated. Invalidated by any data change</div>
+        <span class="tag" style="background:var(--slate-soft);color:var(--slate)">CACHE</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow">↓<span class="note">Every verdict carries <b>source</b> — agent or rules — so a fallback is never shown as AI output</span></div>
+
+  <div class="band">
+    <div class="band-label">4 · Verdict</div>
+    <div class="verdicts">
+      <div class="v v-clear"><div class="n">CLEAR · 70–100</div><div class="m">Fit for duty</div></div>
+      <div class="v v-pend"><div class="n">PENDING_TEST · 45–69</div><div class="m">Escalate to Psychomotor Vigilance Test</div></div>
+      <div class="v v-ground"><div class="n">GROUNDED · 0–44</div><div class="m">Unfit — mandatory rest</div></div>
+    </div>
+  </div>
+
+  <div class="arrow">↓</div>
+
+  <div class="band">
+    <div class="band-label">5 · Dashboard — Cloud Run (public)</div>
+    <div class="row">
+      <div class="box">
+        <div class="t">Fleet view</div>
+        <div class="d">All pilots, sorted risk first. Reads stored verdicts — no model calls</div>
+      </div>
+      <div class="box">
+        <div class="t">Pilot view</div>
+        <div class="d">Verdict, agent reasoning, risk factors, 30-day sleep &amp; HRV trend, PVT trigger</div>
+      </div>
+      <div class="box">
+        <div class="t">Human decision</div>
+        <div class="d">A fatigue officer or scheduler makes the operational call. VigilEye advises</div>
+        <span class="tag" style="background:var(--amber);color:#3a2600">DECISION SUPPORT</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="note-strip">
+    <p><b>Service separation.</b> The API is private and reachable only by the dashboard's service account — pilot biometric and medical data is never on a public endpoint. The dashboard holds no decision logic.</p>
+    <p><b>Integrity boundary.</b> No API endpoint can create or edit a biometric reading. Readings are the evidence behind a go/no-go call, and enter only through the ingestion pipeline.</p>
+  </div>
+</div>
