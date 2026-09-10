@@ -76,7 +76,7 @@ def get_evaluation(driver_id: str) -> dict:
 
 
 def force_reevaluation(driver_id: str) -> dict:
-    """Run the agent again now, ignoring any stored verdict."""
+    """Run Gemini again now, ignoring any stored verdict."""
     r = httpx.post(f"{API}/pilots/{driver_id}/evaluate", params={"refresh": "true"},
                    timeout=TIMEOUT, headers=auth_headers())
     r.raise_for_status()
@@ -201,7 +201,7 @@ with st.sidebar:
         )
 
     st.divider()
-    engine = "🧠 AI agent" if health.get("agent_key_configured") else "📐 Rules engine"
+    engine = "🧠 Gemini (GenAI)" if health.get("agent_key_configured") else "📐 Rules engine"
     st.markdown(
         f'<div style="font-size:0.8rem; color:gray;">📡 Data: <b>{health["data_source"]}</b>'
         f'<br>⚙️ Decision engine: <b>{engine}</b></div>',
@@ -329,7 +329,7 @@ else:
         st.markdown('<div class="section-title">📐 Rules-Based Analysis</div>',
                     unsafe_allow_html=True)
         st.warning(
-            f"⚠️ AI agent unavailable — this verdict came from the deterministic rules engine. "
+            f"⚠️ Gemini unavailable — this verdict came from the deterministic rules engine. "
             f"Reason: {evaluation.get('fallback_reason', 'unknown')}"
         )
     st.info(evaluation["reasoning"])
@@ -345,8 +345,8 @@ else:
         )
     with button_col:
         if st.button("🔄 Re-evaluate now", use_container_width=True,
-                     help="Run the agent again against the latest readings"):
-            with st.spinner("Running the agent..."):
+                     help="Run Gemini again against the latest readings"):
+            with st.spinner("Running Gemini..."):
                 force_reevaluation(driver_id)
             get_evaluation.clear()
             get_fleet.clear()

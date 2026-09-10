@@ -1,6 +1,6 @@
 # VigilEye
 
-**Agentic go/no-go readiness decisions for pilots, from wearable biometrics.**
+**GenAI go/no-go readiness decision support for pilots, from wearable biometrics.**
 
 A pilot flying several legs a day accumulates fatigue that a duty-hours table cannot see. VigilEye reads each pilot's wearable data — sleep duration and staging, heart-rate variability, resting heart rate, hours awake, consecutive duty days — and returns a **CLEAR / PENDING_TEST / GROUNDED** verdict with the reasoning behind it.
 
@@ -14,20 +14,20 @@ A pilot flying several legs a day accumulates fatigue that a duty-hours table ca
 ## How a decision is made
 
 ```
-Wearable tracker  ──►  BigQuery  ──►  Readiness API  ──►  Gemini agent  ──►  Verdict
+Wearable tracker  ──►  BigQuery  ──►  Readiness API  ──►  Gemini model  ──►  Verdict
  (Oura / synthetic)     (readings)      (FastAPI)          (Pro)            (+ stored)
                                              │                                  │
                                              └────────►  Rules engine  ◄────────┘
                                                         (deterministic fallback)
 ```
 
-The **agent** makes the call. It receives the pilot's latest biometrics plus a seven-day trend and medical history, and reasons against aviation fatigue-science context: the 02:00–05:00 Window of Circadian Low, healthy sleep architecture thresholds, HRV as a recovery signal, the point past which wakefulness degrades performance comparably to alcohol, and how a condition like sleep apnea amplifies an already-poor night.
+**Gemini** makes the call — one generative-AI call per pilot, over their complete data. It receives the pilot's latest biometrics plus a seven-day trend and medical history, and reasons against aviation fatigue-science context: the 02:00–05:00 Window of Circadian Low, healthy sleep architecture thresholds, HRV as a recovery signal, the point past which wakefulness degrades performance comparably to alcohol, and how a condition like sleep apnea amplifies an already-poor night.
 
-The **rules engine** is a deterministic weighted model over the same eight factors. It exists so the system degrades rather than fails when the agent is unavailable — and every verdict records which engine produced it, so a fallback can never be presented as an AI decision.
+The **rules engine** is a deterministic weighted model over the same eight factors. It exists so the system degrades rather than fails when Gemini is unavailable — and every verdict records which engine produced it, so a fallback can never be presented as an AI decision.
 
 ### What happens when you click a pilot
 
-The diagram above is where the *data* comes from. This is what happens on a *request* — and the short answer is that the agent runs one pilot at a time, on demand, not as a batch over everyone:
+The diagram above is where the *data* comes from. This is what happens on a *request* — and the short answer is that Gemini runs one pilot at a time, on demand, not as a batch over everyone:
 
 ```
 You open a pilot in the dashboard
@@ -83,7 +83,7 @@ Two Cloud Run services, deliberately split:
 
 | Service | Access | Role |
 |---|---|---|
-| `vigileye-api` | **Private** (IAM) | Data access, scoring, agent orchestration |
+| `vigileye-api` | **Private** (IAM) | Data access, scoring, Gemini calls |
 | `vigileye-dashboard` | Public | Streamlit client — no business logic |
 
 The dashboard holds no decision logic; it calls the API with a Cloud Run ID token. The API is closed to anonymous callers because it serves biometrics and medical history.
@@ -102,7 +102,7 @@ src/vigileye/
 │   ├── agent.py           Gemini, rate-limited to the per-model RPM quota
 │   ├── rules.py           deterministic 8-factor fallback
 │   ├── cache.py           stored verdicts, keyed (pilot, reading date)
-│   └── service.py         agent → fallback, with provenance
+│   └── service.py         Gemini → fallback, with provenance
 └── api/main.py          FastAPI
 ui/dashboard.py          Streamlit client
 ```
@@ -113,11 +113,11 @@ ui/dashboard.py          Streamlit client
 
 **Verdicts are computed once per pilot-day, then stored.** A verdict is a fact about one day's readings, not a per-page-view computation. This keeps the fleet grid and the pilot page showing the same decision, and caps cost at one model call per pilot per day.
 
-**Any write invalidates the affected verdict.** A roster edit, or a tracker re-syncing a corrected reading, drops the stored verdict so the next request re-runs the agent. A verdict about data that no longer exists is never served.
+**Any write invalidates the affected verdict.** A roster edit, or a tracker re-syncing a corrected reading, drops the stored verdict so the next request re-runs Gemini. A verdict about data that no longer exists is never served.
 
 **Rules fallbacks are never cached.** A degraded verdict should be retried, not frozen.
 
-**Pro, not Flash.** A go/no-go call weighs conflicting signals against medical and duty history. That reasoning quality matters more than the seconds of latency it costs, since the agent runs on a single pilot on demand. Override with `GEMINI_MODEL`.
+**Pro, not Flash.** A go/no-go call weighs conflicting signals against medical and duty history. That reasoning quality matters more than the seconds of latency it costs, since Gemini runs on a single pilot on demand. Override with `GEMINI_MODEL`.
 
 ---
 
@@ -127,7 +127,7 @@ Most of this stack is conventional. Four pieces are not, and each exists because
 
 ### 1. Verdicts carry their own provenance — `src/vigileye/models.py`
 
-**The twist.** This system originally shipped with a Gemini agent that had *never once run in production*. A `json.dumps` failure on a BigQuery `DATE` threw inside a broad `except`, which silently fell back to the rules engine. Every "AI verdict" the dashboard ever displayed came from a hardcoded `if/else` — under a heading that read "AI Cumulative Fatigue Analysis."
+**The twist.** This system originally shipped with a Gemini integration that had *never once run in production*. A `json.dumps` failure on a BigQuery `DATE` threw inside a broad `except`, which silently fell back to the rules engine. Every "AI verdict" the dashboard ever displayed came from a hardcoded `if/else` — under a heading that read "AI Cumulative Fatigue Analysis."
 
 The fix isn't better error handling. It's making the fallback *structurally impossible to hide*:
 
@@ -167,7 +167,7 @@ Verdicts are keyed on `(driver_id, reading_date)` and stored. Consequences that 
 
 - The fleet grid and the pilot page cannot disagree — same stored row.
 - Cost is one model call per pilot per day, not per page view.
-- **Any write to the underlying data invalidates the verdict.** A roster edit or a corrected tracker reading drops it, so the next request re-runs the agent. A verdict about data that no longer exists is never served.
+- **Any write to the underlying data invalidates the verdict.** A roster edit or a corrected tracker reading drops it, so the next request re-runs Gemini. A verdict about data that no longer exists is never served.
 - **Rules fallbacks are deliberately not cached** — a degraded verdict should be retried, not frozen.
 
 ### 4. Scoring is a data table, not a branch tree — `src/vigileye/scoring/rules.py`
@@ -203,7 +203,7 @@ Numbers below were measured on this deployment.
 
 The API keeps no state between requests, so Cloud Run runs as many copies as needed and scales to zero when idle. Readings and verdicts live in BigQuery, so any copy can serve any request.
 
-The bigger lever is how often the model is called. A verdict is stored against `(pilot, reading date)`, so the agent runs **once per pilot per day** rather than once per page view. Opening the fleet grid 500 times costs no model calls at all.
+The bigger lever is how often the model is called. A verdict is stored against `(pilot, reading date)`, so Gemini runs **once per pilot per day** rather than once per page view. Opening the fleet grid 500 times costs no model calls at all.
 
 A whole-fleet sweep costs one model call per pilot, so it grows linearly:
 
@@ -256,15 +256,15 @@ And a `RESOURCE_EXHAUSTED` response is retried with a delay. After the fix the s
 
 ### Fault tolerance
 
-If the agent cannot run, the deterministic rules engine answers instead, so the system returns a verdict rather than an error.
+If Gemini cannot run, the deterministic rules engine answers instead, so the system returns a verdict rather than an error.
 
 Every verdict records which engine produced it (`source`) and, for a fallback, why (`fallback_reason`). The dashboard shows a different heading and a warning. This is how the 71-failure run above was noticed.
 
-A BigQuery client that fails to start leaves the connector returning empty results rather than crashing. Verdict store read and write failures are logged and ignored, so losing the store does not lose the verdict. Rules fallbacks are not stored, so the agent is retried next time instead of a downgraded answer being kept.
+A BigQuery client that fails to start leaves the connector returning empty results rather than crashing. Verdict store read and write failures are logged and ignored, so losing the store does not lose the verdict. Rules fallbacks are not stored, so Gemini is retried next time instead of a downgraded answer being kept.
 
 ### Consistency
 
-This project previously had three different definitions of go/no-go: a short heuristic in the dashboard, the rules engine, and the agent. A pilot could show CLEAR in the grid and GROUNDED on their own page.
+This project previously had three different definitions of go/no-go: a short heuristic in the dashboard, the rules engine, and Gemini. A pilot could show CLEAR in the grid and GROUNDED on their own page.
 
 There is now one scoring path and one stored verdict per pilot-day, read by both views. Editing a pilot's roster record clears their verdict, and ingestion replaces rather than appends per pilot-day, so two rows for one day cannot exist and make "latest reading" ambiguous.
 
@@ -301,7 +301,7 @@ def status_for(score: int) -> tuple[str, str]:
     return "GROUNDED", "Remove from duty. Minimum 8 hours continuous rest required."
 ```
 
-### Change what the agent knows
+### Change what Gemini knows
 
 **`src/vigileye/scoring/agent.py`** — `SYSTEM_PROMPT` holds the domain knowledge (WOCL, sleep-architecture thresholds, HRV interpretation, how medical history amplifies risk). Add a regulation or a condition here rather than in the scoring code.
 
@@ -409,7 +409,7 @@ API_BASE_URL=http://localhost:8000 streamlit run ui/dashboard.py
 
 Open **http://localhost:8501**.
 
-**What you should see:** a fleet of 100 pilots, GROUNDED ones first. Click any pilot — the first evaluation takes ~20 seconds because it calls the model; the verdict is then stored, so reopening is instant. The sidebar shows whether decisions are coming from the **AI agent** or the **rules engine**.
+**What you should see:** a fleet of 100 pilots, GROUNDED ones first. Click any pilot — the first evaluation takes ~20 seconds because it calls the model; the verdict is then stored, so reopening is instant. The sidebar shows whether decisions are coming from **Gemini** or the **rules engine**.
 
 > **No Gemini key?** It still runs. Every verdict comes from the deterministic rules engine and the UI labels it plainly, with the reason. That is the fallback behaviour working, and is worth seeing.
 
@@ -455,7 +455,7 @@ This refuses to run if the dataset already holds pilots, so it cannot overwrite 
 pytest        # 65 tests
 ```
 
-No credentials, no network access and no model calls: the suite runs against SQLite with the agent and verdict store stubbed.
+No credentials, no network access and no model calls: the suite runs against SQLite with Gemini and the verdict store stubbed.
 
 ### Regenerating the data
 
@@ -514,7 +514,7 @@ curl -H "Authorization: Bearer $TOKEN" $API/health
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Data source, agent model, whether a key is configured |
+| `GET` | `/health` | Data source, Gemini model, whether a key is configured |
 | `GET` | `/api/v1/fleet` | Every pilot with their current verdict |
 | `GET` | `/api/v1/pilots/{id}?days=7` | Snapshot + history (`days` 1–365, default 30) |
 | `POST` | `/api/v1/pilots/{id}/evaluate?refresh=true` | Go/no-go verdict; `refresh` forces a fresh run |
@@ -581,10 +581,11 @@ Aviation fatigue science and wearable metrics carry a lot of shorthand. Everythi
 | **Deep sleep %** | — | Share of sleep in slow-wave stages. Healthy is >13%. The first stage to suffer under sleep debt or sleep apnea. |
 | **REM sleep %** | Rapid Eye Movement | Share of sleep in REM. Healthy is >15%. Tied to cognitive recovery. |
 | **Sleep architecture** | — | The overall split across deep / REM / light / awake. Two pilots can sleep 7 hours and recover very differently depending on this split. |
-| **Acute vs chronic fatigue** | — | *Acute* is one bad night. *Chronic* is a 7-day average below ~6 hours. Chronic restriction dramatically amplifies the risk of any acute loss — which is why the agent receives both. |
+| **Acute vs chronic fatigue** | — | *Acute* is one bad night. *Chronic* is a 7-day average below ~6 hours. Chronic restriction dramatically amplifies the risk of any acute loss — which is why Gemini receives both. |
 | **Consecutive duty days** | — | Days flown without a rest period. Drives cumulative fatigue. |
 | **Go/no-go** | — | The aviation term for a binary fitness-for-duty decision made before a flight. |
 | **FRMS** | Fatigue Risk Management System | The regulatory framework (FAA/EASA) this problem sits inside. |
-| **Agent** | — | In this codebase, specifically the Gemini model call that produces a verdict — as opposed to the deterministic *rules engine*. |
+| **GenAI** | Generative AI | A model that generates new content — here, Gemini writing a verdict and its reasoning. |
+| **`agent` in the code** | — | A code label, not an AI agent. Identifiers such as `agent.py` and `source: "agent"` mean *the Gemini call*, as opposed to the rules engine. VigilEye is GenAI: the model reasons over the complete data it is given. It does not choose tools or take multi-step actions, which is deliberate for a safety verdict. |
 
 ---
