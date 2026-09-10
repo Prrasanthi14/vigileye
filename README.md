@@ -292,64 +292,112 @@ Not yet built, and the clearest next gap. `api/main.py` would gate `/fleet` and 
 
 ## Running it yourself
 
-### Fastest: use the live deployment
+### Option 0 — just open the live one
 
-**https://vigileye-dashboard-969488392244.us-central1.run.app** — nothing to install or configure. Everything below is only needed to run your own copy.
+**https://vigileye-dashboard-969488392244.us-central1.run.app**
 
-### Option A — locally, no Google Cloud account
+Nothing to install. Everything below is for running your own copy.
 
-This is the quickest way to run the code from a clone. It uses SQLite instead of BigQuery, so you need no GCP project and no billing.
+---
+
+### Option A — on your machine, no Google Cloud account needed
+
+Uses SQLite instead of BigQuery, so there is no project to create and no billing to enable. Takes about five minutes.
+
+**Requirements:** Python 3.11 or newer, and `git`.
+
+**Step 1 — get the code and install it**
 
 ```bash
-git clone <repo-url> && cd vigileye
+git clone <repo-url>
+cd vigileye
 pip install -e ".[api,ui,dev]"
-
-python scripts/bootstrap.py --source sqlite     # 100 pilots, 30 days of biometrics
 ```
 
-**Getting a Gemini API key** (free tier is enough to try it):
+**Step 2 — get a free Gemini API key**
 
-1. Go to **https://aistudio.google.com/apikey**
-2. Sign in with any Google account and click **Create API key**
-3. Copy it into a `.env` file in the project root:
+1. Open **https://aistudio.google.com/apikey**
+2. Sign in with any Google account
+3. Click **Create API key** → **Create API key in new project**
+4. Copy the key
+
+**Step 3 — configure**
 
 ```bash
 cp .env.example .env
 ```
 
+Edit `.env` so it contains at least:
+
 ```
-GEMINI_API_KEY=your-key-here
+GEMINI_API_KEY=paste-your-key-here
 DATA_SOURCE=sqlite
 ```
 
-Then start both halves, in two terminals:
+**Step 4 — create the database**
 
 ```bash
-uvicorn vigileye.api.main:app --port 8000                    # terminal 1
-API_BASE_URL=http://localhost:8000 streamlit run ui/dashboard.py   # terminal 2
+python scripts/bootstrap.py --source sqlite
 ```
 
-Open http://localhost:8501.
+Expected output:
 
-**Without a Gemini key it still runs** — every verdict comes from the deterministic rules engine and is labelled as such in the UI. That is worth seeing on its own: it is the fallback behaviour working.
+```
+Created 100 pilots and 3000 readings in vigileye_fleet.db.
+Next: start the API, then the dashboard (see README).
+```
+
+**Step 5 — start the backend** (leave it running)
+
+```bash
+uvicorn vigileye.api.main:app --port 8000
+```
+
+Check it in a second terminal:
+
+```bash
+curl http://localhost:8000/health
+```
+
+You should see `"data_connected":true` and `"agent_key_configured":true`.
+
+**Step 6 — start the dashboard** (a third terminal)
+
+```bash
+API_BASE_URL=http://localhost:8000 streamlit run ui/dashboard.py
+```
+
+Open **http://localhost:8501**.
+
+**What you should see:** a fleet of 100 pilots, GROUNDED ones first. Click any pilot — the first evaluation takes ~20 seconds because it calls the model; the verdict is then stored, so reopening is instant. The sidebar shows whether decisions are coming from the **AI agent** or the **rules engine**.
+
+> **No Gemini key?** It still runs. Every verdict comes from the deterministic rules engine and the UI labels it plainly, with the reason. That is the fallback behaviour working, and is worth seeing.
+
+---
 
 ### Option B — with your own Google Cloud project
 
-Needed only if you want BigQuery as the backend, as the live deployment uses.
+Only needed to use BigQuery, as the live deployment does.
 
-1. Create a project at **https://console.cloud.google.com**
-2. Enable BigQuery: `gcloud services enable bigquery.googleapis.com`
-3. Authenticate: `gcloud auth application-default login`
-4. Point `.env` at it:
+**Step 1 — create a project** at https://console.cloud.google.com and note the project ID.
+
+**Step 2 — enable BigQuery and sign in**
+
+```bash
+gcloud services enable bigquery.googleapis.com
+gcloud auth application-default login
+```
+
+**Step 3 — configure `.env`**
 
 ```
 GCP_PROJECT_ID=your-project-id
 BIGQUERY_DATASET=vigileye_fleet
 DATA_SOURCE=bigquery
-GEMINI_API_KEY=your-key-here
+GEMINI_API_KEY=paste-your-key-here
 ```
 
-5. Create and fill the tables:
+**Step 4 — create the dataset and fill it**
 
 ```bash
 python scripts/bootstrap.py --source bigquery
@@ -357,44 +405,52 @@ python scripts/bootstrap.py --source bigquery
 
 This refuses to run if the dataset already holds pilots, so it cannot overwrite a working deployment by accident. Pass `--force` to overwrite deliberately.
 
-### Tests
+**Step 5 and 6** are the same as Option A.
+
+---
+
+### Running the tests
 
 ```bash
 pytest        # 65 tests
 ```
 
-No credentials, no network, no model calls — the suite runs against SQLite with the agent and verdict store stubbed.
+No credentials, no network access and no model calls: the suite runs against SQLite with the agent and verdict store stubbed.
 
-### Regenerating data
+### Regenerating the data
 
 ```bash
 python scripts/bootstrap.py --source sqlite --pilots 50 --days 60   # rebuild from scratch
 python scripts/generate_fleet.py --days 30 --replace                # readings only, BigQuery
 ```
 
-The generator models physiology rather than drawing independent random numbers: day-to-day persistence, accumulating sleep debt, per-pilot baselines, night-shift degradation, sleep apnea suppressing deep sleep, and occasional acute disruptions. It reproduces a sleep-to-HRV correlation of about 0.47, in the range seen in real wearable data.
+The generator models physiology rather than drawing independent random numbers: day-to-day persistence, accumulating sleep debt, per-pilot baselines, night-shift degradation, sleep apnea suppressing deep sleep, and occasional acute disruptions. On the current dataset that produces a sleep-to-HRV correlation of about 0.47, in the range seen in real wearable data.
 
 ### Deploying to Cloud Run
 
 ```bash
-gcloud run deploy vigileye-api --source . --region us-central1 --timeout 900
+# 1. API — private, so only the dashboard can reach the biometric data
+gcloud run deploy vigileye-api --source . --region us-central1 \
+  --timeout 900 --no-allow-unauthenticated \
+  --set-env-vars "GCP_PROJECT_ID=your-project,BIGQUERY_DATASET=vigileye_fleet,DATA_SOURCE=bigquery"
+
 gcloud run services update vigileye-api --region us-central1 \
-  --update-env-vars GEMINI_API_KEY=your-key-here
+  --update-env-vars GEMINI_API_KEY=paste-your-key-here
 
+# 2. Dashboard
 gcloud builds submit --config cloudbuild.ui.yaml \
-  --substitutions _IMAGE=gcr.io/PROJECT/vigileye-ui:v1
+  --substitutions _IMAGE=gcr.io/your-project/vigileye-ui:v1
 gcloud run deploy vigileye-dashboard --region us-central1 \
-  --image gcr.io/PROJECT/vigileye-ui:v1 --allow-unauthenticated \
+  --image gcr.io/your-project/vigileye-ui:v1 --allow-unauthenticated \
   --set-env-vars API_BASE_URL=https://your-api-url
-```
 
-The API is deployed private, so the dashboard's service account needs permission to call it:
-
-```bash
+# 3. Let the dashboard call the private API
 gcloud run services add-iam-policy-binding vigileye-api --region us-central1 \
   --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
   --role="roles/run.invoker"
 ```
+
+Opening the API URL in a browser returns **403**. That is correct — it has no identity token. Use the dashboard URL.
 
 
 ## API
