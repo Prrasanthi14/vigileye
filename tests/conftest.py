@@ -45,6 +45,21 @@ EXHAUSTED = dict(report_time="03:30", total_sleep_hours=3.1, deep_sleep_pct=7.0,
                  consecutive_duty_days=7)
 
 
+@pytest.fixture(autouse=True)
+def ledger(monkeypatch):
+    """In-memory token ledger, so no test ever writes to BigQuery."""
+    from vigileye.scoring import usage
+
+    rows: list = []
+    monkeypatch.setattr(usage, "record_call",
+                        lambda driver_id, meta, model: rows.append(("call", driver_id)) or 0)
+    monkeypatch.setattr(usage, "record_store_hit",
+                        lambda driver_id: rows.append(("hit", driver_id)))
+    monkeypatch.setattr(usage, "tokens_used_today", lambda: 0)
+    monkeypatch.setattr(usage, "summary", lambda: usage.summarize({}, 0))
+    return rows
+
+
 @pytest.fixture
 def db_path(tmp_path) -> str:
     path = tmp_path / "test_fleet.db"

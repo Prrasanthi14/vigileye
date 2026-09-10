@@ -254,6 +254,27 @@ def _throttle() -> None:
 
 And a `RESOURCE_EXHAUSTED` response is retried with a delay. After the fix the same run gave 71 evaluated, 0 failed. `GEMINI_RPM` should be set to match whatever quota the account has.
 
+### Token usage
+
+Every Gemini call's token counts are appended to a `token_usage` ledger in BigQuery, and every verdict served from the store is logged as a zero-cost row. `GET /api/v1/usage` and the dashboard sidebar report today's spend and a **calculated** saving: reuses × today's measured average per call.
+
+Measured per verdict (Gemini Pro, default thinking):
+
+| Part | Tokens |
+|---|---|
+| Input: instructions + pilot data | ~450 |
+| Thinking: hidden reasoning | ~1,400 |
+| Output: the verdict | ~200 |
+| **Total** | **~2,100–2,500** |
+
+What keeps it down:
+
+- **Stored verdicts.** The fleet grid costs 0 tokens instead of ~220,000 for 100 pilots, and reopening a pilot within 2 hours costs 0 instead of ~2,200.
+- **A smaller payload.** Pilot name and ID are never sent (privacy), and the JSON is compact. Input dropped from ~557 to ~447 tokens with no change in verdict.
+- **A daily ceiling.** `DAILY_TOKEN_BUDGET` (default 500,000, about 200 fresh verdicts). Past it, verdicts fall back to the rules engine, labelled with the reason. `0` disables the cap.
+
+**Not applied:** capping thinking with `GEMINI_THINKING_LEVEL=low` cut tokens by 40–55%, but in a three-pilot test it turned one PENDING_TEST verdict into CLEAR 90. That's a cheaper answer in the unsafe direction, so the setting is available but off by default.
+
 ### Fault tolerance
 
 If Gemini cannot run, the deterministic rules engine answers instead, so the system returns a verdict rather than an error.
@@ -519,6 +540,7 @@ curl -H "Authorization: Bearer $TOKEN" $API/health
 | `GET` | `/api/v1/pilots/{id}?days=7` | Snapshot + history (`days` 1–365, default 30) |
 | `POST` | `/api/v1/pilots/{id}/evaluate?refresh=true` | Go/no-go verdict; `refresh` forces a fresh run |
 | `POST` | `/api/v1/pilots/{id}/pvt` | Simulated Psychomotor Vigilance Test |
+| `GET` | `/api/v1/usage` | Gemini tokens used today, tokens saved by stored verdicts, budget left |
 | `POST` | `/api/v1/fleet/evaluate` | Evaluate the whole fleet (scheduled job; ~5 min) |
 | `POST` | `/api/v1/pilots` | Create a pilot |
 | `PATCH` | `/api/v1/pilots/{id}` | Update roster fields |

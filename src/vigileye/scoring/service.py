@@ -7,7 +7,7 @@ from typing import Any
 
 from ..config import settings
 from ..models import Evaluation
-from . import cache
+from . import cache, usage
 from .agent import AgentUnavailable, evaluate_with_agent
 from .rules import evaluate_with_rules
 
@@ -52,6 +52,7 @@ def evaluate_readiness(data: dict[str, Any], use_cache: bool = True) -> Evaluati
     if use_cache and driver_id and reading_date:
         cached = cache.get_verdict(driver_id, reading_date)
         if cached and not is_stale(cached):
+            usage.record_store_hit(driver_id)
             return cached
 
     try:

@@ -75,6 +75,16 @@ def get_evaluation(driver_id: str) -> dict:
     return r.json()
 
 
+@st.cache_data(ttl=60)
+def get_usage() -> dict:
+    try:
+        r = httpx.get(f"{API}/usage", timeout=TIMEOUT, headers=auth_headers())
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPError:
+        return {}
+
+
 def force_reevaluation(driver_id: str) -> dict:
     """Run Gemini again now, ignoring any stored verdict."""
     r = httpx.post(f"{API}/pilots/{driver_id}/evaluate", params={"refresh": "true"},
@@ -207,6 +217,18 @@ with st.sidebar:
         f'<br>⚙️ Decision engine: <b>{engine}</b></div>',
         unsafe_allow_html=True,
     )
+
+    tokens = get_usage()
+    if tokens:
+        budget = tokens.get("daily_budget")
+        spent = f'{tokens["tokens_used"]:,}' + (f" of {budget:,}" if budget else "")
+        st.markdown(
+            f'<div style="font-size:0.8rem; color:gray; margin-top:6px;">'
+            f'🔢 Gemini tokens today: <b>{spent}</b>'
+            f'<br>♻️ Saved by stored verdicts: <b>{tokens["tokens_saved_by_store"]:,}</b>'
+            f' ({tokens["verdicts_served_from_store"]} reuses)</div>',
+            unsafe_allow_html=True,
+        )
 
 if selected == "🏠 Fleet Command Center":
     st.markdown("## Fleet Overview")
@@ -350,6 +372,7 @@ else:
                 force_reevaluation(driver_id)
             get_evaluation.clear()
             get_fleet.clear()
+            get_usage.clear()
             st.session_state[f"refreshed_{driver_id}"] = True
             st.rerun()
 

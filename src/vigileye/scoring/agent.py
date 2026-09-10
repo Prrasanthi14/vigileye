@@ -1,4 +1,4 @@
-"""Gemini-backed readiness agent."""
+"""Gemini readiness evaluation: one structured-output call per pilot."""
 
 import json
 import logging
@@ -10,6 +10,7 @@ from typing import Any
 
 from ..config import settings
 from ..models import ReadinessEvaluation
+from . import usage
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 # workers trip the quota and silently degrade every pilot to the rules engine.
 RPM_LIMIT = int(os.getenv("GEMINI_RPM", "20"))
 MAX_RETRIES = 3
+
+# The verdict depends on a pilot's biometrics and history, not on who they are,
+# so identity never leaves our systems for a third-party model.
+IDENTITY_FIELDS = frozenset({"name", "driver_id"})
 
 _lock = threading.Lock()
 _recent_calls: deque[float] = deque()
@@ -34,6 +39,7 @@ def _throttle() -> None:
                 return
             wait = 60 - (now - _recent_calls[0]) + 0.05
         time.sleep(wait)
+
 
 SYSTEM_PROMPT = """
 You are an expert fatigue risk management system analyst for the aviation sector (VigilEye).
@@ -56,12 +62,30 @@ matching the requested schema exactly.
 
 
 class AgentUnavailable(RuntimeError):
-    """The agent could not produce a verdict; caller should fall back."""
+    """Gemini could not produce a verdict; caller should fall back."""
+
+
+def build_payload(data: dict[str, Any]) -> str:
+    """Pilot data as sent to Gemini: without identity fields, as compact JSON.
+
+    Indented JSON is billed by the token like any other input, so whitespace is
+    stripped; on a typical pilot that is roughly a quarter of the data tokens.
+    """
+    fields = {k: v for k, v in data.items() if k not in IDENTITY_FIELDS}
+    # default=str so BigQuery DATE values serialize instead of raising.
+    return json.dumps(fields, separators=(",", ":"), default=str)
 
 
 def evaluate_with_agent(data: dict[str, Any]) -> ReadinessEvaluation:
     if not settings.gemini_api_key:
         raise AgentUnavailable("GEMINI_API_KEY is not set")
+
+    exhausted, used = usage.budget_exhausted()
+    if exhausted:
+        raise AgentUnavailable(
+            f"Daily token budget reached ({used:,} of {settings.daily_token_budget:,} "
+            "tokens); resets at 00:00 UTC"
+        )
 
     try:
         from google import genai
@@ -69,23 +93,28 @@ def evaluate_with_agent(data: dict[str, Any]) -> ReadinessEvaluation:
         raise AgentUnavailable("google-genai is not installed") from exc
 
     client = genai.Client(api_key=settings.gemini_api_key)
-    # default=str so BigQuery DATE values serialize instead of raising.
-    payload = json.dumps(data, indent=2, default=str)
+    config: dict[str, Any] = {
+        "system_instruction": SYSTEM_PROMPT,
+        "response_mime_type": "application/json",
+        "response_schema": ReadinessEvaluation,
+    }
+    if settings.gemini_thinking_level:
+        config["thinking_config"] = {"thinking_level": settings.gemini_thinking_level}
+
+    contents = ("Analyze the following pilot data and provide a readiness evaluation:\n"
+                + build_payload(data))
 
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         _throttle()
         try:
             response = client.models.generate_content(
-                model=settings.gemini_model,
-                contents=f"Analyze the following pilot data and provide a readiness evaluation:\n{payload}",
-                config={
-                    "system_instruction": SYSTEM_PROMPT,
-                    "response_mime_type": "application/json",
-                    "response_schema": ReadinessEvaluation,
-                },
+                model=settings.gemini_model, contents=contents, config=config
             )
-            return ReadinessEvaluation.model_validate_json(response.text)
+            verdict = ReadinessEvaluation.model_validate_json(response.text)
+            usage.record_call(data.get("driver_id"), response.usage_metadata,
+                              getattr(response, "model_version", None) or settings.gemini_model)
+            return verdict
         except Exception as exc:
             last_error = exc
             if "RESOURCE_EXHAUSTED" not in str(exc) or attempt == MAX_RETRIES - 1:

@@ -17,6 +17,8 @@ class Settings:
     gemini_api_key: str | None
     api_base_url: str
     verdict_max_age_minutes: int
+    daily_token_budget: int
+    gemini_thinking_level: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -32,6 +34,12 @@ class Settings:
             # Fatigue moves with the clock, so a verdict has a shelf life: past
             # this age it is re-run against whatever the tracker has since landed.
             verdict_max_age_minutes=int(os.getenv("VERDICT_MAX_AGE_MINUTES", "120")),
+            # Hard ceiling on Gemini tokens per UTC day. Past it, verdicts fall back
+            # to the rules engine, labelled with the reason. 0 disables the cap.
+            daily_token_budget=int(os.getenv("DAILY_TOKEN_BUDGET", "500000")),
+            # Optional cap on the model's hidden reasoning ("low" / "high"). Empty
+            # keeps the model default.
+            gemini_thinking_level=os.getenv("GEMINI_THINKING_LEVEL", ""),
         )
 
 

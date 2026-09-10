@@ -9,7 +9,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query
 from ..config import settings
 from ..data import get_connector
 from ..models import Evaluation, PilotCreate, PilotUpdate
-from ..scoring import cache
+from ..scoring import cache, usage
 from ..scoring.rules import score_pilot, status_for
 from ..scoring.service import evaluate_readiness, simulate_pvt_test
 
@@ -64,6 +64,12 @@ def fleet() -> list[dict]:
             rows.append({**record, "score": score, "status": status, "source": "rules",
                          "evaluated_at": None, "age_minutes": None, "stale": True})
     return rows
+
+
+@router.get("/usage")
+def token_usage() -> dict:
+    """Gemini tokens spent today (UTC), what stored verdicts saved, and budget left."""
+    return usage.summary()
 
 
 @router.post("/fleet/evaluate")
