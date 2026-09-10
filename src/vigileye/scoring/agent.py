@@ -2,12 +2,38 @@
 
 import json
 import logging
+import os
+import threading
+import time
+from collections import deque
 from typing import Any
 
 from ..config import settings
 from ..models import ReadinessEvaluation
 
 logger = logging.getLogger(__name__)
+
+# Gemini enforces a per-model requests-per-minute quota (25 for Pro). Fleet-wide
+# evaluation runs concurrently, so pace calls here rather than letting parallel
+# workers trip the quota and silently degrade every pilot to the rules engine.
+RPM_LIMIT = int(os.getenv("GEMINI_RPM", "20"))
+MAX_RETRIES = 3
+
+_lock = threading.Lock()
+_recent_calls: deque[float] = deque()
+
+
+def _throttle() -> None:
+    while True:
+        with _lock:
+            now = time.monotonic()
+            while _recent_calls and now - _recent_calls[0] > 60:
+                _recent_calls.popleft()
+            if len(_recent_calls) < RPM_LIMIT:
+                _recent_calls.append(now)
+                return
+            wait = 60 - (now - _recent_calls[0]) + 0.05
+        time.sleep(wait)
 
 SYSTEM_PROMPT = """
 You are an expert fatigue risk management system analyst for the aviation sector (VigilEye).
@@ -46,16 +72,26 @@ def evaluate_with_agent(data: dict[str, Any]) -> ReadinessEvaluation:
     # default=str so BigQuery DATE values serialize instead of raising.
     payload = json.dumps(data, indent=2, default=str)
 
-    try:
-        response = client.models.generate_content(
-            model=settings.gemini_model,
-            contents=f"Analyze the following pilot data and provide a readiness evaluation:\n{payload}",
-            config={
-                "system_instruction": SYSTEM_PROMPT,
-                "response_mime_type": "application/json",
-                "response_schema": ReadinessEvaluation,
-            },
-        )
-        return ReadinessEvaluation.model_validate_json(response.text)
-    except Exception as exc:
-        raise AgentUnavailable(str(exc)) from exc
+    last_error: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        _throttle()
+        try:
+            response = client.models.generate_content(
+                model=settings.gemini_model,
+                contents=f"Analyze the following pilot data and provide a readiness evaluation:\n{payload}",
+                config={
+                    "system_instruction": SYSTEM_PROMPT,
+                    "response_mime_type": "application/json",
+                    "response_schema": ReadinessEvaluation,
+                },
+            )
+            return ReadinessEvaluation.model_validate_json(response.text)
+        except Exception as exc:
+            last_error = exc
+            if "RESOURCE_EXHAUSTED" not in str(exc) or attempt == MAX_RETRIES - 1:
+                break
+            backoff = 20 * (attempt + 1)
+            logger.warning("Rate limited; retrying in %ss (attempt %d).", backoff, attempt + 1)
+            time.sleep(backoff)
+
+    raise AgentUnavailable(str(last_error)) from last_error
