@@ -8,6 +8,28 @@ A pilot flying several legs a day accumulates fatigue that a duty-hours table ca
 
 ---
 
+## Glossary
+
+Aviation fatigue science and wearable metrics carry a lot of shorthand. Everything used in this project, in one place:
+
+| Term | Stands for | What it means here |
+|---|---|---|
+| **PVT** | Psychomotor Vigilance Test | A real reaction-time test used in aviation and military fatigue management. Measures mean reaction time and *lapses* (attention failures). VigilEye escalates borderline pilots to a PVT instead of guessing. |
+| **HRV** | Heart Rate Variability | Beat-to-beat variation, in milliseconds. **Higher is better** — it signals nervous-system recovery. Below ~35 ms suggests poor recovery or stress. The single strongest fatigue signal here. |
+| **RMSSD** | Root Mean Square of Successive Differences | The specific way HRV is calculated by most wearables. When the dashboard says "HRV (RMSSD)", this is the method. |
+| **WOCL** | Window of Circadian Low | The 02:00–05:00 body-clock trough where alertness bottoms out. Reporting for duty inside this window is an independent risk factor, regardless of how well the pilot slept. |
+| **Resting HR** | Resting Heart Rate | Beats per minute at rest. **Lower is better.** Moves inversely to HRV — an elevated resting HR alongside suppressed HRV indicates accumulated strain. |
+| **Deep sleep %** | — | Share of sleep in slow-wave stages. Healthy is >13%. The first stage to suffer under sleep debt or sleep apnea. |
+| **REM sleep %** | Rapid Eye Movement | Share of sleep in REM. Healthy is >15%. Tied to cognitive recovery. |
+| **Sleep architecture** | — | The overall split across deep / REM / light / awake. Two pilots can sleep 7 hours and recover very differently depending on this split. |
+| **Acute vs chronic fatigue** | — | *Acute* is one bad night. *Chronic* is a 7-day average below ~6 hours. Chronic restriction dramatically amplifies the risk of any acute loss — which is why the agent receives both. |
+| **Consecutive duty days** | — | Days flown without a rest period. Drives cumulative fatigue. |
+| **Go/no-go** | — | The aviation term for a binary fitness-for-duty decision made before a flight. |
+| **FRMS** | Fatigue Risk Management System | The regulatory framework (FAA/EASA) this problem sits inside. |
+| **Agent** | — | In this codebase, specifically the Gemini model call that produces a verdict — as opposed to the deterministic *rules engine*. |
+
+---
+
 ## How a decision is made
 
 ```
@@ -75,6 +97,142 @@ ui/dashboard.py          Streamlit client
 **Rules fallbacks are never cached.** A degraded verdict should be retried, not frozen.
 
 **Pro, not Flash.** A go/no-go call weighs conflicting signals against medical and duty history. That reasoning quality matters more than the seconds of latency it costs, since the agent runs on a single pilot on demand. Override with `GEMINI_MODEL`.
+
+---
+
+## What's actually novel here
+
+Most of this stack is conventional. Four pieces are not, and each exists because of a specific failure this project hit.
+
+### 1. Verdicts carry their own provenance — `src/vigileye/models.py`
+
+**The twist.** This system originally shipped with a Gemini agent that had *never once run in production*. A `json.dumps` failure on a BigQuery `DATE` threw inside a broad `except`, which silently fell back to the rules engine. Every "AI verdict" the dashboard ever displayed came from a hardcoded `if/else` — under a heading that read "AI Cumulative Fatigue Analysis."
+
+The fix isn't better error handling. It's making the fallback *structurally impossible to hide*:
+
+```python
+class Evaluation(ReadinessEvaluation):
+    """A readiness verdict plus provenance of which engine produced it.
+
+    The dashboard labels AI verdicts differently from deterministic ones, so a
+    silent fallback to the rules engine can never be presented as agent output.
+    """
+
+    source: Literal["agent", "rules"]
+    fallback_reason: str | None = None
+```
+
+`source` travels with every verdict through the API and into the UI, which renders a different heading and a visible warning carrying the real reason. A degraded decision announces itself. In a safety system, a verdict you can't attribute is worse than no verdict.
+
+This also caught a later bug on its own: a fleet-wide run silently degraded 71 of 100 pilots to rules after hitting a rate limit, and the provenance labels made it obvious immediately.
+
+### 2. Biometrics have no write path — `src/vigileye/api/main.py`
+
+The most important code here is code that **doesn't exist**. There is no endpoint to create or edit a reading, and that absence is documented in place so nobody helpfully adds one:
+
+```python
+# NOTE: there is deliberately no endpoint to write or edit biometric readings.
+# Readings are evidence for a go/no-go call, so a human-facing write path would
+# let an official clear a grounded pilot by editing the evidence. Readings enter
+# only through the ingestion pipeline (vigileye.ingestion), which runs as a job
+# under GCP credentials and records the source of every row.
+```
+
+Roster fields *are* editable, because they're administrative. Readings are evidence. A test class asserts the boundary holds across every HTTP verb.
+
+### 3. A verdict is a fact about data, not a computation — `src/vigileye/scoring/cache.py`
+
+Verdicts are keyed on `(driver_id, reading_date)` and stored. Consequences that fall out of that framing:
+
+- The fleet grid and the pilot page cannot disagree — same stored row.
+- Cost is one model call per pilot per day, not per page view.
+- **Any write to the underlying data invalidates the verdict.** A roster edit or a corrected tracker reading drops it, so the next request re-runs the agent. A verdict about data that no longer exists is never served.
+- **Rules fallbacks are deliberately not cached** — a degraded verdict should be retried, not frozen.
+
+### 4. Scoring is a data table, not a branch tree — `src/vigileye/scoring/rules.py`
+
+The original rules engine was 174 lines of repeated `if/elif` — and its weights summed to **1.05**, so a well-rested pilot scored 105 and crashed Pydantic validation. Worse, every score was silently inflated ~5%, shifting pilots across the CLEAR/PENDING thresholds.
+
+It's now a declarative table where thresholds are data and the comparison operator is part of the band:
+
+```python
+FACTORS = (
+    Factor("total_sleep_hours", 0.25, 0, (
+        (gt, 7, 100, None),
+        (ge, 6, 80, None),
+        (ge, 5, 55, "Suboptimal sleep duration (5-6h)"),
+        (ge, 4, 20, "Insufficient sleep duration (4-5h)"),
+    ), (0, "Severe sleep deprivation (<4h)")),
+    ...
+)
+
+# Weights total 1.05, not 1.0 — normalize so the score stays within 0-100.
+return int(round(weighted / TOTAL_WEIGHT)), risks, note
+```
+
+The refactor was verified behaviour-preserving by property-testing old against new across 4,000 randomised pilots — 0 mismatches.
+
+---
+
+## Extending it
+
+Each of these is a single file, and the interface around it is the point.
+
+### Add a wearable vendor (Fitbit, Garmin, Whoop)
+
+**`src/vigileye/ingestion/base.py`** defines the contract. Implement it in a new file beside `oura.py`:
+
+```python
+class WearableProvider(ABC):
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @abstractmethod
+    def fetch_readings(self, driver_ids: list[str], start: date, end: date) -> list[DailyReading]:
+        """Readings for the given pilots over an inclusive date range."""
+```
+
+Map the vendor's response into `DailyReading` and nothing downstream changes — scoring, storage, caching and the API are all vendor-agnostic. This interface exists because Google Fit, the original plan, turned out to be closed to new signups and shutting down; the abstraction is insurance against that repeating.
+
+### Retune the fatigue model
+
+**`src/vigileye/scoring/rules.py`** — edit the `FACTORS` table. Weights need not sum to 1.0; `TOTAL_WEIGHT` normalizes whatever you choose. To move the verdict boundaries, edit `status_for()`:
+
+```python
+def status_for(score: int) -> tuple[str, str]:
+    if score >= 70:
+        return "CLEAR", "Proceed with scheduled duties."
+    if score >= 45:
+        return "PENDING_TEST", "Administer PVT ... before duty."
+    return "GROUNDED", "Remove from duty. Minimum 8 hours continuous rest required."
+```
+
+### Change what the agent knows
+
+**`src/vigileye/scoring/agent.py`** — `SYSTEM_PROMPT` holds the domain knowledge (WOCL, sleep-architecture thresholds, HRV interpretation, how medical history amplifies risk). Add a regulation or a condition here rather than in the scoring code.
+
+### Swap the model
+
+**`src/vigileye/config.py`** — no code change needed:
+
+```bash
+gcloud run services update vigileye-api --region us-central1 \
+  --update-env-vars GEMINI_MODEL=gemini-3.1-pro-preview
+```
+
+If you move to a model with a different quota, set `GEMINI_RPM` to match — `agent.py` paces calls against it.
+
+### Add a storage backend
+
+**`src/vigileye/data/base.py`** — implement `DataConnector` (see `bigquery.py` and `sqlite.py`), then register it in `data/__init__.py::get_connector()`. `DATA_SOURCE` selects it.
+
+### Replace the simulated PVT with a real one
+
+**`src/vigileye/scoring/service.py`** — `simulate_pvt_test()` currently generates plausible reaction times from the readiness score. Swap the body for a call to a real test harness; the API contract and the UI trigger stay as they are.
+
+### Add role-based access
+
+Not yet built, and the clearest next gap. `api/main.py` would gate `/fleet` and `/pilots/{id}` on the caller's identity so a pilot sees only their own record while a fleet manager sees all. The IAP header (`X-Goog-Authenticated-User-Email`) is the natural source once the project sits under a Cloud Organization.
 
 ---
 
