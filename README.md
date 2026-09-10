@@ -10,79 +10,6 @@ A pilot flying several legs a day accumulates fatigue that a duty-hours table ca
 
 ---
 
-## System design
-
-Numbers below were measured on this deployment.
-
-### Scalability
-
-The API keeps no state between requests, so Cloud Run runs as many copies as needed and scales to zero when idle. Readings and verdicts live in BigQuery, so any copy can serve any request.
-
-The bigger lever is how often the model is called. A verdict is stored against `(pilot, reading date)`, so the agent runs **once per pilot per day** rather than once per page view. Opening the fleet grid 500 times costs no model calls at all.
-
-A whole-fleet sweep costs one model call per pilot, so it grows linearly:
-
-| Fleet | Full sweep |
-|---|---|
-| 100 (this deployment) | **5 min**, measured |
-| ~5,000 | ~4.2 hours |
-| ~15,000 | ~12.5 hours |
-
-Past a few hundred pilots, sweeping everyone stops working. The roster already stores each pilot's `report_time`, so the same work can be spread out by evaluating each pilot shortly before they report — which also only touches pilots actually flying that day. At 5,000 pilots with 40% on duty that is about 1.4 calls per minute. This is not built yet.
-
-### Latency
-
-Three paths, with different costs:
-
-| Path | Model calls | Time |
-|---|---|---|
-| Fleet grid, 100 pilots | 0 | two BigQuery reads |
-| Pilot page, verdict already stored | 0 | **2.3 s** |
-| Pilot page, no stored verdict | 1 | **21.3 s** |
-
-That 2.3s vs 21.3s difference is why verdicts are stored. Batch runs use 6 concurrent workers. The dashboard holds API responses for 60 seconds. The health check allows 60 seconds because the API scales to zero, so the first request after an idle period waits for a container to start and BigQuery to authenticate.
-
-Verdicts also expire. `time_awake_since_last_sleep` grows over the day, so a verdict gets less accurate with age even if the stored reading has not changed. Past `VERDICT_MAX_AGE_MINUTES` (default 120) it is recomputed.
-
-### Rate limiting
-
-Gemini Pro allows 25 requests per minute. An early fleet run used 12 workers at once, exceeded that, and 71 of 100 pilots fell back to the rules engine.
-
-Two things prevent it now. Calls are paced below the quota:
-
-```python
-# src/vigileye/scoring/agent.py
-RPM_LIMIT = int(os.getenv("GEMINI_RPM", "20"))
-
-def _throttle() -> None:
-    while True:
-        with _lock:
-            now = time.monotonic()
-            while _recent_calls and now - _recent_calls[0] > 60:
-                _recent_calls.popleft()
-            if len(_recent_calls) < RPM_LIMIT:
-                _recent_calls.append(now)
-                return
-            wait = 60 - (now - _recent_calls[0]) + 0.05
-        time.sleep(wait)
-```
-
-And a `RESOURCE_EXHAUSTED` response is retried with a delay. After the fix the same run gave 71 evaluated, 0 failed. `GEMINI_RPM` should be set to match whatever quota the account has.
-
-### Fault tolerance
-
-If the agent cannot run, the deterministic rules engine answers instead, so the system returns a verdict rather than an error.
-
-Every verdict records which engine produced it (`source`) and, for a fallback, why (`fallback_reason`). The dashboard shows a different heading and a warning. This is how the 71-failure run above was noticed.
-
-A BigQuery client that fails to start leaves the connector returning empty results rather than crashing. Verdict store read and write failures are logged and ignored, so losing the store does not lose the verdict. Rules fallbacks are not stored, so the agent is retried next time instead of a downgraded answer being kept.
-
-### Consistency
-
-This project previously had three different definitions of go/no-go: a short heuristic in the dashboard, the rules engine, and the agent. A pilot could show CLEAR in the grid and GROUNDED on their own page.
-
-There is now one scoring path and one stored verdict per pilot-day, read by both views. Editing a pilot's roster record clears their verdict, and ingestion replaces rather than appends per pilot-day, so two rows for one day cannot exist and make "latest reading" ambiguous.
-
 
 ## How a decision is made
 
@@ -97,6 +24,46 @@ Wearable tracker  ──►  BigQuery  ──►  Readiness API  ──►  Gemi
 The **agent** makes the call. It receives the pilot's latest biometrics plus a seven-day trend and medical history, and reasons against aviation fatigue-science context: the 02:00–05:00 Window of Circadian Low, healthy sleep architecture thresholds, HRV as a recovery signal, the point past which wakefulness degrades performance comparably to alcohol, and how a condition like sleep apnea amplifies an already-poor night.
 
 The **rules engine** is a deterministic weighted model over the same eight factors. It exists so the system degrades rather than fails when the agent is unavailable — and every verdict records which engine produced it, so a fallback can never be presented as an AI decision.
+
+### What happens when you click a pilot
+
+The diagram above is where the *data* comes from. This is what happens on a *request* — and the short answer is that the agent runs one pilot at a time, on demand, not as a batch over everyone:
+
+```
+You open a pilot in the dashboard
+          │
+          ▼
+POST /api/v1/pilots/{id}/evaluate
+          │
+          ▼
+  Read that pilot's latest row from BigQuery
+          │
+          ▼
+  Is a verdict already stored for (this pilot, this reading date),
+  and less than 2 hours old?
+          │
+    ┌─────┴─────┐
+   YES          NO
+    │            │
+    │            ▼
+    │      Call Gemini Pro  ──── fails? ───►  Rules engine
+    │       (~21 s)          (no key,          (instant)
+    │            │            quota, outage)        │
+    │            ▼                                  ▼
+    │      Store the verdict                 source="rules"
+    │            │                           + the reason why
+    ▼            ▼                                  │
+ Return stored ──┴──────────────────────────────────┘
+   (~2 s)                    │
+                             ▼
+              Dashboard shows the verdict, labelled
+              with which engine produced it
+```
+
+Two other entry points exist:
+
+- **Opening the fleet grid** reads stored verdicts only — **zero** model calls, however many times you load it.
+- **`POST /api/v1/fleet/evaluate`** sweeps every pilot, one model call each, skipping any whose verdict is current. It is triggered by an operator; nothing runs it on a timer.
 
 ### The three verdicts
 
@@ -227,6 +194,79 @@ return int(round(weighted / TOTAL_WEIGHT)), risks, note
 The refactor was verified behaviour-preserving by property-testing old against new across 4,000 randomised pilots — 0 mismatches.
 
 ---
+
+## System design
+
+Numbers below were measured on this deployment.
+
+### Scalability
+
+The API keeps no state between requests, so Cloud Run runs as many copies as needed and scales to zero when idle. Readings and verdicts live in BigQuery, so any copy can serve any request.
+
+The bigger lever is how often the model is called. A verdict is stored against `(pilot, reading date)`, so the agent runs **once per pilot per day** rather than once per page view. Opening the fleet grid 500 times costs no model calls at all.
+
+A whole-fleet sweep costs one model call per pilot, so it grows linearly:
+
+| Fleet | Full sweep |
+|---|---|
+| 100 (this deployment) | **5 min**, measured |
+| ~5,000 | ~4.2 hours |
+| ~15,000 | ~12.5 hours |
+
+Past a few hundred pilots, sweeping everyone stops working. The roster already stores each pilot's `report_time`, so the same work can be spread out by evaluating each pilot shortly before they report — which also only touches pilots actually flying that day. At 5,000 pilots with 40% on duty that is about 1.4 calls per minute. This is not built yet.
+
+### Latency
+
+Three paths, with different costs:
+
+| Path | Model calls | Time |
+|---|---|---|
+| Fleet grid, 100 pilots | 0 | two BigQuery reads |
+| Pilot page, verdict already stored | 0 | **2.3 s** |
+| Pilot page, no stored verdict | 1 | **21.3 s** |
+
+That 2.3s vs 21.3s difference is why verdicts are stored. Batch runs use 6 concurrent workers. The dashboard holds API responses for 60 seconds. The health check allows 60 seconds because the API scales to zero, so the first request after an idle period waits for a container to start and BigQuery to authenticate.
+
+Verdicts also expire. `time_awake_since_last_sleep` grows over the day, so a verdict gets less accurate with age even if the stored reading has not changed. Past `VERDICT_MAX_AGE_MINUTES` (default 120) it is recomputed.
+
+### Rate limiting
+
+Gemini Pro allows 25 requests per minute. An early fleet run used 12 workers at once, exceeded that, and 71 of 100 pilots fell back to the rules engine.
+
+Two things prevent it now. Calls are paced below the quota:
+
+```python
+# src/vigileye/scoring/agent.py
+RPM_LIMIT = int(os.getenv("GEMINI_RPM", "20"))
+
+def _throttle() -> None:
+    while True:
+        with _lock:
+            now = time.monotonic()
+            while _recent_calls and now - _recent_calls[0] > 60:
+                _recent_calls.popleft()
+            if len(_recent_calls) < RPM_LIMIT:
+                _recent_calls.append(now)
+                return
+            wait = 60 - (now - _recent_calls[0]) + 0.05
+        time.sleep(wait)
+```
+
+And a `RESOURCE_EXHAUSTED` response is retried with a delay. After the fix the same run gave 71 evaluated, 0 failed. `GEMINI_RPM` should be set to match whatever quota the account has.
+
+### Fault tolerance
+
+If the agent cannot run, the deterministic rules engine answers instead, so the system returns a verdict rather than an error.
+
+Every verdict records which engine produced it (`source`) and, for a fallback, why (`fallback_reason`). The dashboard shows a different heading and a warning. This is how the 71-failure run above was noticed.
+
+A BigQuery client that fails to start leaves the connector returning empty results rather than crashing. Verdict store read and write failures are logged and ignored, so losing the store does not lose the verdict. Rules fallbacks are not stored, so the agent is retried next time instead of a downgraded answer being kept.
+
+### Consistency
+
+This project previously had three different definitions of go/no-go: a short heuristic in the dashboard, the rules engine, and the agent. A pilot could show CLEAR in the grid and GROUNDED on their own page.
+
+There is now one scoring path and one stored verdict per pilot-day, read by both views. Editing a pilot's roster record clears their verdict, and ingestion replaces rather than appends per pilot-day, so two rows for one day cannot exist and make "latest reading" ambiguous.
 
 ## Extending it
 
