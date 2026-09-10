@@ -112,23 +112,6 @@ class BigQueryConnector(DataConnector):
                 driver_id=driver_id,
             ).result()
 
-    def upsert_reading(self, driver_id: str, reading: dict[str, Any]) -> None:
-        # Delete-then-insert rather than MERGE: the source table has an `id`
-        # column the API does not populate, which MERGE would have to invent.
-        self._run(
-            f"DELETE FROM {self._table('daily_readings')} "
-            "WHERE driver_id = @driver_id AND date = @date",
-            driver_id=driver_id, date=reading["date"],
-        ).result()
-
-        columns = ["driver_id", *reading.keys()]
-        placeholders = ", ".join(f"@{c}" for c in columns)
-        query = f"""
-            INSERT INTO {self._table('daily_readings')} ({', '.join(columns)})
-            VALUES ({placeholders})
-        """
-        self._run(query, driver_id=driver_id, **reading).result()
-
     def get_source_name(self) -> str:
         return "Google BigQuery"
 

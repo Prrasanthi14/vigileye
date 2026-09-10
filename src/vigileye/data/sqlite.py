@@ -94,21 +94,6 @@ class SQLiteConnector(DataConnector):
             conn.execute("DELETE FROM daily_readings WHERE driver_id = ?", (driver_id,))
             conn.execute("DELETE FROM pilots WHERE driver_id = ?", (driver_id,))
 
-    def upsert_reading(self, driver_id: str, reading: dict[str, Any]) -> None:
-        row = {"driver_id": driver_id, **reading}
-        row["date"] = str(row["date"])
-        columns = ", ".join(row)
-        placeholders = ", ".join("?" for _ in row)
-        with self._get_conn() as conn:
-            conn.execute(
-                "DELETE FROM daily_readings WHERE driver_id = ? AND date = ?",
-                (driver_id, row["date"]),
-            )
-            conn.execute(
-                f"INSERT INTO daily_readings ({columns}) VALUES ({placeholders})",
-                tuple(row.values()),
-            )
-
     def get_source_name(self) -> str:
         return "SQLite (local development)"
 

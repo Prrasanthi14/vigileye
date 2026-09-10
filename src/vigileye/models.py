@@ -47,36 +47,3 @@ class PilotUpdate(BaseModel):
     medical_history: str | None = Field(default=None, max_length=200)
 
 
-class ReadingInput(BaseModel):
-    """One day of biometrics for a pilot."""
-
-    date: date
-    report_time: str = Field(default="08:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    total_sleep_hours: float = Field(ge=0, le=24)
-    deep_sleep_pct: float = Field(ge=0, le=100)
-    rem_sleep_pct: float = Field(ge=0, le=100)
-    light_sleep_pct: float = Field(ge=0, le=100)
-    awake_during_sleep_pct: float = Field(ge=0, le=100)
-    hrv_ms: float = Field(ge=0, le=300)
-    resting_hr: int = Field(ge=25, le=200)
-    time_awake_since_last_sleep: float = Field(ge=0, le=48)
-    consecutive_duty_days: int = Field(ge=0, le=60)
-
-
-class PilotSnapshot(BaseModel):
-    driver_id: str
-    name: str
-    role: str = ""
-    shift_type: str = ""
-    report_time: str = "--:--"
-    medical_history: str = "None"
-    last_sync_timestamp: date | None = None
-    total_sleep_hours: float = 0.0
-    deep_sleep_pct: float = 0.0
-    rem_sleep_pct: float = 0.0
-    hrv_ms: float = 0.0
-    resting_hr: int = 65
-    time_awake_since_last_sleep: float = 0.0
-    consecutive_duty_days: int = 1
-    seven_day_avg_sleep: float | None = None
-    seven_day_avg_hrv: float | None = None

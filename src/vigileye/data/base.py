@@ -49,10 +49,6 @@ class DataConnector(ABC):
         """Remove a pilot and their readings."""
 
     @abstractmethod
-    def upsert_reading(self, driver_id: str, reading: dict[str, Any]) -> None:
-        """Insert or replace one pilot-day of biometrics."""
-
-    @abstractmethod
     def get_source_name(self) -> str:
         ...
 

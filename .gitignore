@@ -27,3 +27,8 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Build / IDE / test artifacts
+*.egg-info/
+.pytest_cache/
+.idea/
