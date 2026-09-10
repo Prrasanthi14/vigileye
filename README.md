@@ -495,11 +495,21 @@ Opening the API URL in a browser returns **403**. That is correct — it has no 
 
 ## API
 
-Private — every request needs a Google identity token.
+The deployed API is **private**. Only the dashboard's service account and the project owner can call it, because it serves biometrics and medical history — so the hosted API URL is not something you can try from outside this project. Opening it in a browser returns `403`, which is the control working, not an outage.
+
+**To explore the API yourself, run it locally** (Option A above needs no Google Cloud account). Locally there is no IAM in front of it:
+
+```bash
+API=http://localhost:8000
+curl $API/health
+```
+
+Against a deployment you own, add an identity token — these expire after about an hour, so regenerate as needed:
 
 ```bash
 TOKEN=$(gcloud auth print-identity-token)
-API=https://vigileye-api-969488392244.us-central1.run.app
+API=https://your-api-url
+curl -H "Authorization: Bearer $TOKEN" $API/health
 ```
 
 | Method | Path | Purpose |
@@ -515,7 +525,7 @@ API=https://vigileye-api-969488392244.us-central1.run.app
 | `DELETE` | `/api/v1/pilots/{id}` | Remove a pilot and their readings |
 
 ```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" $API/api/v1/pilots/PAT-004/evaluate
+curl -X POST $API/api/v1/pilots/PAT-004/evaluate
 ```
 
 ```json
