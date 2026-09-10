@@ -470,13 +470,31 @@ This refuses to run if the dataset already holds pilots, so it cannot overwrite 
 
 ---
 
-### Running the tests
+### Testing
+
+**88 automated tests**, all passing. They run against a local SQLite database, with Gemini, the verdict store and the token ledger replaced by in-memory stand-ins. The suite needs no cloud credentials, makes no network calls, costs nothing and finishes in under a second.
 
 ```bash
-pytest        # 88 tests
+pip install -e ".[api,ui,dev]"
+pytest
 ```
 
-No credentials, no network access and no model calls: the suite runs against SQLite with Gemini and the verdict store stubbed.
+| Area | Tests | What is checked |
+|---|---|---|
+| **Scoring engine** — `tests/test_rules.py` | 36 | A perfectly rested pilot scores exactly 100 (regression test for an early bug where it scored 105). Every verdict boundary (69/70, 44/45). The 02:00–05:00 circadian window, including its edges. Bad or missing input never crashes. Medical history lowers the fallback score, and sleep apnea compounds with low deep sleep. All 303 label-and-score combinations end consistent, with the stricter reading winning. |
+| **API contract** — `tests/test_api.py` | 23 | History returns the most recent N days, not the oldest (regression test). Invalid input gets the right status code (400, 404, 409, 422). **No HTTP method (PUT, POST, PATCH or DELETE) can write a biometric reading**, and a roster update can't slip one through. Roster create, update and delete work correctly. |
+| **Evaluation service** — `tests/test_service.py` | 19 | Every verdict is labelled with the engine that produced it. A fallback carries its reason and is still a valid verdict. A stored verdict is reused without calling Gemini, a fallback is never stored, and a forced refresh bypasses the store. Verdicts expire after exactly two hours, and an expired one triggers a fresh evaluation. |
+| **Token accounting** — `tests/test_usage.py` | 10 | Tokens saved are calculated correctly from reuses. An exhausted daily budget blocks the model call, and the fallback says why. A budget of 0 means no limit. **A pilot's name and ID are never sent to Gemini.** A reuse is recorded at zero cost. |
+
+**Also verified against the live deployment** (real Cloud Run, BigQuery and Gemini):
+
+- **Access control:** an anonymous request to the API returns 403. The dashboard returns 200 and works without a Google account.
+- **Corrected readings replace stale verdicts:** an exhausted reading gave GROUNDED (10). Re-syncing a corrected, rested reading for the same day gave CLEAR (98), not the stored verdict.
+- **One reading per pilot per day:** re-syncing the same pilot-day three times left exactly one row, holding the latest value.
+- **Rate limiting:** before calls were paced, a fleet run exceeded Gemini's quota and 71 of 100 pilots fell back to the rules engine. After pacing, all 100 were evaluated with no failures.
+- **Label and score consistency:** after the fix, 0 of 100 live verdicts show a label that contradicts its score (previously 32).
+- **Token ledger:** a fresh verdict recorded its exact cost (2,448 tokens: 470 input, 1,796 thinking, 182 output). Reopening the same pilot recorded a zero-cost reuse.
+- **Fresh clone:** cloning the repo, creating the local database and running the tests all work without a Google Cloud account.
 
 ### Regenerating the data
 
