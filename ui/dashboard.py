@@ -7,6 +7,7 @@ import httpx
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from rapidfuzz import fuzz, process
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 API = f"{API_BASE}/api/v1"
@@ -69,6 +70,31 @@ def get_evaluation(driver_id: str) -> dict:
     return r.json()
 
 
+FUZZY_CUTOFF = 72
+
+
+def fuzzy_match(df: pd.DataFrame, text: str, limit: int = 10) -> pd.DataFrame:
+    """Nearest pilots by name or ID, best match first.
+
+    Name and ID are scored as separate fields. Matching against them joined
+    dilutes short queries — "lnda" scores too low against "pat-016 linda davis"
+    to clear the cutoff, but matches "linda davis" cleanly.
+    """
+    if df.empty:
+        return df
+
+    best: dict[int, float] = {}
+    for column in ("name", "driver_id"):
+        haystack = df[column].str.lower().tolist()
+        for _, score, index in process.extract(
+            text, haystack, scorer=fuzz.WRatio, limit=limit, score_cutoff=FUZZY_CUTOFF
+        ):
+            best[index] = max(best.get(index, 0), score)
+
+    ranked = sorted(best, key=lambda i: -best[i])[:limit]
+    return df.iloc[ranked]
+
+
 def api_health() -> dict:
     # Generous timeout: the API scales to zero, so the first call of an idle
     # period pays for a container boot plus BigQuery client auth.
@@ -97,12 +123,21 @@ with st.sidebar:
     )
 
     matches = fleet_df
+    fuzzy_hit = False
     if query:
         text = query.strip().lower()
-        matches = matches[
-            matches["driver_id"].str.lower().str.contains(text, na=False)
-            | matches["name"].str.lower().str.contains(text, na=False)
+        exact = matches[
+            matches["driver_id"].str.lower().str.contains(text, na=False, regex=False)
+            | matches["name"].str.lower().str.contains(text, na=False, regex=False)
         ]
+        if exact.empty:
+            # Nothing matched literally — fall back to fuzzy, so a misspelling
+            # ("davies", "PAT-04") still finds the pilot instead of dead-ending.
+            matches = fuzzy_match(matches, text)
+            fuzzy_hit = not matches.empty
+        else:
+            matches = exact
+
     if status_filter:
         matches = matches[matches["status"].isin(status_filter)]
 
@@ -117,7 +152,8 @@ with st.sidebar:
 
     filtering = bool(query or status_filter)
     if filtering:
-        st.caption(f"{len(matches)} of {len(fleet_df)} pilots match")
+        note = " (closest matches)" if fuzzy_hit else ""
+        st.caption(f"{len(matches)} of {len(fleet_df)} pilots match{note}")
 
     if len(options) == 1:
         st.warning("No pilots match that search.")
