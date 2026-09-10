@@ -271,7 +271,7 @@ What keeps it down:
 
 - **Stored verdicts.** The fleet grid costs 0 tokens instead of ~200,000 for 100 pilots, and reopening a pilot within 2 hours costs 0 instead of ~2,000.
 - **A smaller payload.** Pilot name and ID are never sent (privacy), and the JSON is compact. Input dropped from ~557 to ~447 tokens with no change in verdict.
-- **A daily ceiling.** `DAILY_TOKEN_BUDGET` (default 500,000, about 200 fresh verdicts). Past it, verdicts fall back to the rules engine, labelled with the reason. `0` disables the cap.
+- **A daily ceiling.** `DAILY_TOKEN_BUDGET` (default 500,000, about 250 fresh verdicts). Past it, verdicts fall back to the rules engine, labelled with the reason. `0` disables the cap.
 
 **Not applied:** capping thinking with `GEMINI_THINKING_LEVEL=low` cut tokens by 40–55%, but in a three-pilot test it turned one PENDING_TEST verdict into CLEAR 90. That's a cheaper answer in the unsafe direction, so the setting is available but off by default.
 
