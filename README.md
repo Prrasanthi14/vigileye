@@ -12,47 +12,47 @@ A pilot flying several legs a day accumulates fatigue that a duty-hours table ca
 
 ## System design
 
-Every number below was measured on this deployment, not estimated.
+Numbers below were measured on this deployment.
 
 ### Scalability
 
-**Stateless services, stateful storage.** The API holds no session state, so Cloud Run scales it horizontally and to zero. Verdicts and readings live in BigQuery; any instance can serve any request.
+The API keeps no state between requests, so Cloud Run runs as many copies as needed and scales to zero when idle. Readings and verdicts live in BigQuery, so any copy can serve any request.
 
-**The decisive choice is *what* gets computed, not how fast.** A verdict is keyed on `(driver_id, reading_date)` and stored, so cost is **one model call per pilot per day** rather than one per page view. A fleet grid viewed 500 times costs zero model calls.
+The bigger lever is how often the model is called. A verdict is stored against `(pilot, reading date)`, so the agent runs **once per pilot per day** rather than once per page view. Opening the fleet grid 500 times costs no model calls at all.
 
-**Where it stops scaling, stated honestly.** A whole-fleet sweep is O(pilots) in model calls:
+A whole-fleet sweep costs one model call per pilot, so it grows linearly:
 
 | Fleet | Full sweep |
 |---|---|
-| 100 (this deployment) | **5 min** — measured |
-| ~5,000 (IndiGo scale) | ~4.2 hours |
-| ~15,000 (major US carrier) | ~12.5 hours |
+| 100 (this deployment) | **5 min**, measured |
+| ~5,000 | ~4.2 hours |
+| ~15,000 | ~12.5 hours |
 
-Past a few hundred pilots the sweep is the wrong shape. The fix is in the design already: the roster stores each pilot's `report_time`, so evaluating a pilot ~2h before they report spreads identical work across 24 hours and touches only pilots actually flying. At 5,000 pilots with 40% on duty that's **1.4 calls/minute** — the same infrastructure, no sweep.
+Past a few hundred pilots, sweeping everyone stops working. The roster already stores each pilot's `report_time`, so the same work can be spread out by evaluating each pilot shortly before they report — which also only touches pilots actually flying that day. At 5,000 pilots with 40% on duty that is about 1.4 calls per minute. This is not built yet.
 
 ### Latency
 
-Three paths, deliberately different costs:
+Three paths, with different costs:
 
-| Path | Model calls | Measured |
+| Path | Model calls | Time |
 |---|---|---|
-| Fleet grid (100 pilots) | **0** | two BigQuery reads |
-| Pilot page, verdict fresh | **0** | **2.3 s** |
-| Pilot page, verdict absent/stale | 1 | **21.3 s** |
+| Fleet grid, 100 pilots | 0 | two BigQuery reads |
+| Pilot page, verdict already stored | 0 | **2.3 s** |
+| Pilot page, no stored verdict | 1 | **21.3 s** |
 
-The 9× gap between a stored and a computed verdict is the entire argument for the cache. Supporting measures: batch work runs on 6 concurrent workers; the dashboard caches API responses for 60 s; and the health check allows 60 s because Cloud Run scales to zero and the first request after idle pays for a container boot plus BigQuery auth.
+That 2.3s vs 21.3s difference is why verdicts are stored. Batch runs use 6 concurrent workers. The dashboard holds API responses for 60 seconds. The health check allows 60 seconds because the API scales to zero, so the first request after an idle period waits for a container to start and BigQuery to authenticate.
 
-**Latency is also a correctness property here.** `time_awake_since_last_sleep` climbs with the clock, so a verdict has a shelf life regardless of whether the data changed. Past `VERDICT_MAX_AGE_MINUTES` (default 120) it is recomputed rather than served.
+Verdicts also expire. `time_awake_since_last_sleep` grows over the day, so a verdict gets less accurate with age even if the stored reading has not changed. Past `VERDICT_MAX_AGE_MINUTES` (default 120) it is recomputed.
 
 ### Rate limiting
 
-This one was learned the hard way. A first fleet run used 12 concurrent workers against Gemini Pro's **25 requests/minute** quota: **71 of 100 pilots failed** and silently degraded to the rules engine.
+Gemini Pro allows 25 requests per minute. An early fleet run used 12 workers at once, exceeded that, and 71 of 100 pilots fell back to the rules engine.
 
-Two mechanisms now:
+Two things prevent it now. Calls are paced below the quota:
 
 ```python
 # src/vigileye/scoring/agent.py
-RPM_LIMIT = int(os.getenv("GEMINI_RPM", "20"))   # stay under the per-model quota
+RPM_LIMIT = int(os.getenv("GEMINI_RPM", "20"))
 
 def _throttle() -> None:
     while True:
@@ -67,24 +67,22 @@ def _throttle() -> None:
         time.sleep(wait)
 ```
 
-A thread-safe sliding window paces calls below the quota, and `RESOURCE_EXHAUSTED` responses retry with backoff. Re-run after the fix: **71 evaluated, 0 failed.** `GEMINI_RPM` tracks whatever quota the account actually has.
+And a `RESOURCE_EXHAUSTED` response is retried with a delay. After the fix the same run gave 71 evaluated, 0 failed. `GEMINI_RPM` should be set to match whatever quota the account has.
 
-### Fault tolerance and availability
+### Fault tolerance
 
-The fourth pillar — the system degrades rather than fails, and *says so*.
+If the agent cannot run, the deterministic rules engine answers instead, so the system returns a verdict rather than an error.
 
-- **Agent unavailable → deterministic rules engine.** No blank screen, no 500. A go/no-go tool that returns nothing when an API is down is worse than one that returns a conservative answer.
-- **Degradation is never silent.** Every verdict carries `source: "agent" | "rules"` and a `fallback_reason`. The dashboard renders a different heading and a visible warning. This is what caught the 71-failure incident above.
-- **Storage failures are contained.** A BigQuery client that fails to initialise leaves the connector returning empty results rather than crashing the service; verdict cache read/write failures are logged and swallowed, because losing the cache must not lose the verdict.
-- **A degraded verdict is never cached.** Rules fallbacks are deliberately not stored, so the system retries the agent instead of freezing a downgraded answer.
+Every verdict records which engine produced it (`source`) and, for a fallback, why (`fallback_reason`). The dashboard shows a different heading and a warning. This is how the 71-failure run above was noticed.
+
+A BigQuery client that fails to start leaves the connector returning empty results rather than crashing. Verdict store read and write failures are logged and ignored, so losing the store does not lose the verdict. Rules fallbacks are not stored, so the agent is retried next time instead of a downgraded answer being kept.
 
 ### Consistency
 
-Worth naming, because it was the original failure mode. This codebase once had **three different definitions of go/no-go** — a two-line heuristic in the dashboard, an eight-factor rules engine, and the agent — so a pilot could read CLEAR in the grid and GROUNDED on their own page.
+This project previously had three different definitions of go/no-go: a short heuristic in the dashboard, the rules engine, and the agent. A pilot could show CLEAR in the grid and GROUNDED on their own page.
 
-Now: one scoring engine, one stored verdict per pilot-day, read by both views. Writes invalidate the affected verdict, and ingestion upserts per pilot-day so two rows can never exist for one pilot-day leaving "latest reading" non-deterministic.
+There is now one scoring path and one stored verdict per pilot-day, read by both views. Editing a pilot's roster record clears their verdict, and ingestion replaces rather than appends per pilot-day, so two rows for one day cannot exist and make "latest reading" ambiguous.
 
----
 
 ## How a decision is made
 
@@ -292,52 +290,112 @@ Not yet built, and the clearest next gap. `api/main.py` would gate `/fleet` and 
 
 ---
 
-## Running it
+## Running it yourself
 
-### Prerequisites
-Python 3.11+, a GCP project with BigQuery, and a Gemini API key from [AI Studio](https://aistudio.google.com/apikey).
+### Fastest: use the live deployment
+
+**https://vigileye-dashboard-969488392244.us-central1.run.app** — nothing to install or configure. Everything below is only needed to run your own copy.
+
+### Option A — locally, no Google Cloud account
+
+This is the quickest way to run the code from a clone. It uses SQLite instead of BigQuery, so you need no GCP project and no billing.
 
 ```bash
-cp .env.example .env      # fill in GCP_PROJECT_ID and GEMINI_API_KEY
+git clone <repo-url> && cd vigileye
 pip install -e ".[api,ui,dev]"
+
+python scripts/bootstrap.py --source sqlite     # 100 pilots, 30 days of biometrics
 ```
 
-### Locally
+**Getting a Gemini API key** (free tier is enough to try it):
+
+1. Go to **https://aistudio.google.com/apikey**
+2. Sign in with any Google account and click **Create API key**
+3. Copy it into a `.env` file in the project root:
 
 ```bash
-# terminal 1 — the API
-uvicorn vigileye.api.main:app --port 8000
-
-# terminal 2 — the dashboard
-API_BASE_URL=http://localhost:8000 streamlit run ui/dashboard.py
+cp .env.example .env
 ```
+
+```
+GEMINI_API_KEY=your-key-here
+DATA_SOURCE=sqlite
+```
+
+Then start both halves, in two terminals:
+
+```bash
+uvicorn vigileye.api.main:app --port 8000                    # terminal 1
+API_BASE_URL=http://localhost:8000 streamlit run ui/dashboard.py   # terminal 2
+```
+
+Open http://localhost:8501.
+
+**Without a Gemini key it still runs** — every verdict comes from the deterministic rules engine and is labelled as such in the UI. That is worth seeing on its own: it is the fallback behaviour working.
+
+### Option B — with your own Google Cloud project
+
+Needed only if you want BigQuery as the backend, as the live deployment uses.
+
+1. Create a project at **https://console.cloud.google.com**
+2. Enable BigQuery: `gcloud services enable bigquery.googleapis.com`
+3. Authenticate: `gcloud auth application-default login`
+4. Point `.env` at it:
+
+```
+GCP_PROJECT_ID=your-project-id
+BIGQUERY_DATASET=vigileye_fleet
+DATA_SOURCE=bigquery
+GEMINI_API_KEY=your-key-here
+```
+
+5. Create and fill the tables:
+
+```bash
+python scripts/bootstrap.py --source bigquery
+```
+
+This refuses to run if the dataset already holds pilots, so it cannot overwrite a working deployment by accident. Pass `--force` to overwrite deliberately.
 
 ### Tests
 
 ```bash
-pytest                    # 56 tests, no GCP credentials or API calls needed
+pytest        # 65 tests
 ```
 
-The suite runs against SQLite with the agent and verdict store stubbed, so it is hermetic.
+No credentials, no network, no model calls — the suite runs against SQLite with the agent and verdict store stubbed.
 
-### Seeding data
+### Regenerating data
 
 ```bash
-python scripts/seed_roster.py                       # 100 pilots, unique names
-python scripts/generate_fleet.py --days 30 --replace  # 30 days of biometrics
+python scripts/bootstrap.py --source sqlite --pilots 50 --days 60   # rebuild from scratch
+python scripts/generate_fleet.py --days 30 --replace                # readings only, BigQuery
 ```
 
-The synthetic generator models real physiology rather than independent random values: day-to-day persistence (AR(1)), accumulating sleep debt, per-pilot baselines, night-shift degradation, sleep apnea suppressing deep sleep, and ~7% daily acute disruptions. It reproduces a sleep↔HRV correlation of ~0.47, within the range observed in real wearable data.
+The generator models physiology rather than drawing independent random numbers: day-to-day persistence, accumulating sleep debt, per-pilot baselines, night-shift degradation, sleep apnea suppressing deep sleep, and occasional acute disruptions. It reproduces a sleep-to-HRV correlation of about 0.47, in the range seen in real wearable data.
 
-### Deploying
+### Deploying to Cloud Run
 
 ```bash
 gcloud run deploy vigileye-api --source . --region us-central1 --timeout 900
-gcloud builds submit --config cloudbuild.ui.yaml --substitutions _IMAGE=gcr.io/PROJECT/vigileye-ui:vN
-gcloud run deploy vigileye-dashboard --region us-central1 --image gcr.io/PROJECT/vigileye-ui:vN
+gcloud run services update vigileye-api --region us-central1 \
+  --update-env-vars GEMINI_API_KEY=your-key-here
+
+gcloud builds submit --config cloudbuild.ui.yaml \
+  --substitutions _IMAGE=gcr.io/PROJECT/vigileye-ui:v1
+gcloud run deploy vigileye-dashboard --region us-central1 \
+  --image gcr.io/PROJECT/vigileye-ui:v1 --allow-unauthenticated \
+  --set-env-vars API_BASE_URL=https://your-api-url
 ```
 
----
+The API is deployed private, so the dashboard's service account needs permission to call it:
+
+```bash
+gcloud run services add-iam-policy-binding vigileye-api --region us-central1 \
+  --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+  --role="roles/run.invoker"
+```
+
 
 ## API
 

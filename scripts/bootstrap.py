@@ -123,12 +123,27 @@ def write_sqlite(roster: list[dict], readings: list[dict], db_path: str) -> None
     conn.close()
 
 
-def write_bigquery(roster: list[dict], readings: list[dict]) -> None:
+def write_bigquery(roster: list[dict], readings: list[dict], force: bool = False) -> None:
     from google.cloud import bigquery
 
     client = bigquery.Client(project=settings.gcp_project_id)
     dataset_id = f"{settings.gcp_project_id}.{settings.bigquery_dataset}"
     client.create_dataset(bigquery.Dataset(dataset_id), exists_ok=True)
+
+    # Bootstrapping replaces both tables. Refuse to do that to a dataset that
+    # already holds pilots, so this cannot quietly wipe a running deployment.
+    if not force:
+        try:
+            existing = client.get_table(f"{dataset_id}.pilots").num_rows
+        except Exception:
+            existing = 0
+        if existing:
+            raise SystemExit(
+                f"{dataset_id}.pilots already holds {existing} pilots.\n"
+                "Bootstrapping would replace them and orphan every stored verdict.\n"
+                "Use --force to overwrite deliberately, or point BIGQUERY_DATASET "
+                "at a new dataset."
+            )
 
     pilots_schema = [bigquery.SchemaField(c.strip(), "STRING")
                      for c in PILOTS_COLUMNS.split(",")]
@@ -162,6 +177,8 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--db-path", default="vigileye_fleet.db")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite a dataset that already holds pilots")
     args = parser.parse_args()
 
     roster = build_roster(args.pilots, args.seed)
@@ -171,7 +188,7 @@ def main() -> None:
         write_sqlite(roster, readings, args.db_path)
         where = args.db_path
     else:
-        write_bigquery(roster, readings)
+        write_bigquery(roster, readings, force=args.force)
         where = f"{settings.gcp_project_id}.{settings.bigquery_dataset}"
 
     print(f"Created {len(roster)} pilots and {len(readings)} readings in {where}.")
